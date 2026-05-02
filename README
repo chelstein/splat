@@ -106,3 +106,54 @@ can be found on the SPLAT! Web Site:
 John A. Magliacane, KD2BD
 May 2011
 
+
+Genoa sidecar API service
+=========================
+A lightweight API wrapper is available in `genoa_sidecar.py` so other tools
+(such as Genoa) can run SPLAT! through HTTP.
+
+Run it from the repository root:
+
+	GENOA_PORT=8080 ./genoa_sidecar.py
+
+Endpoints:
+
+* `GET /healthz` returns `{ "status": "ok" }`
+* `POST /api/v1/splat/run` runs SPLAT! and returns stdout/stderr.
+
+Example request body:
+
+	{
+	  "tx_qth": "sample_data/wnju-dt.qth",
+	  "rx_qth": "sample_data/wnju-dt.qth",
+	  "output_base": "out/coverage.ppm",
+	  "flags": ["-metric", "-dbm"],
+	  "timeout_seconds": 120
+	}
+
+Environment variables:
+
+* `GENOA_HOST` (default `0.0.0.0`)
+* `GENOA_PORT` (default `8080`)
+* `SPLAT_BIN` (default `./splat`)
+* `SPLAT_WORKDIR` (default current directory)
+
+Web dashboard + deployment
+=========================
+The sidecar now includes a frontend dashboard at `/` to view health, workload,
+and effectiveness metrics (success rate + average runtime), and to run jobs.
+
+Additional API:
+* `GET /api/v1/stats` returns total runs, success/failure counts, success rate,
+  average runtime, and last run metadata.
+
+Deploy on DigitalOcean App Platform:
+1. Build/push using `Dockerfile` (or connect your repo in App Platform).
+2. Use `.do-app.yaml` as the app spec.
+3. Expose port `8080` and set env vars as needed (`SPLAT_BIN`, `SPLAT_WORKDIR`).
+4. Configure trusted apps to call `POST /api/v1/splat/run` and optionally poll
+   `/api/v1/stats` for workload/health dashboards.
+
+For app-to-app communication, put this service behind App Platform's ingress,
+then allow other internal services to call it via its app URL or internal
+network endpoint with your standard auth proxy (recommended).

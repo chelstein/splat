@@ -1,0 +1,15 @@
+name: genoa-splat-sidecar
+services:
+  - name: api
+    github: {}
+    dockerfile_path: Dockerfile
+    http_port: 8080
+    instance_count: 1
+    instance_size_slug: basic-xxs
+    routes:
+      - path: /
+    envs:
+      - key: GENOA_PORT
+        value: "8080"
+      - key: GENOA_HOST
+        value: "0.0.0.0"
