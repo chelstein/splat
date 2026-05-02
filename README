@@ -174,3 +174,6 @@ Cross-app communication:
 * Use `GENOA_ALLOWED_ORIGIN` for browser clients.
 * Other backend services should call `/api/v1/splat/run` and `/api/v1/stats`
   over internal networking or a private gateway.
+If deployment failed because the image build could not find `/app/splat`, the
+updated `Dockerfile` now compiles SPLAT! from source in a builder stage and
+copies the generated binary into the runtime image.
