@@ -137,9 +137,6 @@ Environment variables:
 * `GENOA_PORT` (default `8080`)
 * `SPLAT_BIN` (default `./splat`)
 * `SPLAT_WORKDIR` (default current directory)
-
-Web dashboard + deployment
-=========================
 The sidecar now includes a frontend dashboard at `/` to view health, workload,
 and effectiveness metrics (success rate + average runtime), and to run jobs.
 
@@ -159,7 +156,6 @@ then allow other internal services to call it via its app URL or internal
 network endpoint with your standard auth proxy (recommended).
 
 DigitalOcean "No components detected" fix
-=========================================
 If DigitalOcean reports **No components detected**, ensure deployment is started
 from the repository root (this directory) where these files exist:
 
@@ -178,9 +174,6 @@ Cross-app communication:
 * Use `GENOA_ALLOWED_ORIGIN` for browser clients.
 * Other backend services should call `/api/v1/splat/run` and `/api/v1/stats`
   over internal networking or a private gateway.
-
-Build failure fix ("command exited with code 1")
-================================================
 If deployment failed because the image build could not find `/app/splat`, the
 updated `Dockerfile` now compiles SPLAT! from source in a builder stage and
 copies the generated binary into the runtime image.
