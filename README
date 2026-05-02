@@ -106,3 +106,34 @@ can be found on the SPLAT! Web Site:
 John A. Magliacane, KD2BD
 May 2011
 
+
+Genoa sidecar API service
+=========================
+A lightweight API wrapper is available in `genoa_sidecar.py` so other tools
+(such as Genoa) can run SPLAT! through HTTP.
+
+Run it from the repository root:
+
+	GENOA_PORT=8080 ./genoa_sidecar.py
+
+Endpoints:
+
+* `GET /healthz` returns `{ "status": "ok" }`
+* `POST /api/v1/splat/run` runs SPLAT! and returns stdout/stderr.
+
+Example request body:
+
+	{
+	  "tx_qth": "sample_data/wnju-dt.qth",
+	  "rx_qth": "sample_data/wnju-dt.qth",
+	  "output_base": "out/coverage.ppm",
+	  "flags": ["-metric", "-dbm"],
+	  "timeout_seconds": 120
+	}
+
+Environment variables:
+
+* `GENOA_HOST` (default `0.0.0.0`)
+* `GENOA_PORT` (default `8080`)
+* `SPLAT_BIN` (default `./splat`)
+* `SPLAT_WORKDIR` (default current directory)
