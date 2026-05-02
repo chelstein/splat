@@ -177,3 +177,8 @@ Cross-app communication:
 If deployment failed because the image build could not find `/app/splat`, the
 updated `Dockerfile` now compiles SPLAT! from source in a builder stage and
 copies the generated binary into the runtime image.
+
+Important: in `.do-app.yaml`, `source_dir` must be `.` (not `/`) so Docker build context is the repository root.
+If deployment failed because the image build could not find `/app/splat`, the
+updated `Dockerfile` now compiles SPLAT! from source in a builder stage and
+copies the generated binary into the runtime image.
