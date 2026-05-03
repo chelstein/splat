@@ -1,130 +1,108 @@
 #!/usr/bin/env python3
+"""Genoa sidecar HTTP service for running SPLAT! as an API endpoint."""
+
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import subprocess
-import threading
-import time
-from dataclasses import asdict, dataclass
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from flask import Flask, jsonify, request, send_file
-
 HOST = os.getenv("GENOA_HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", os.getenv("GENOA_PORT", "8080")))
+PORT = int(os.getenv("GENOA_PORT", "8080"))
 SPLAT_BIN = os.getenv("SPLAT_BIN", "./splat")
 WORKDIR = Path(os.getenv("SPLAT_WORKDIR", ".")).resolve()
-DASHBOARD = Path(__file__).with_name("dashboard.html")
 
 
-@dataclass
-class RunStats:
-    total_runs: int = 0
-    success_runs: int = 0
-    failed_runs: int = 0
-    avg_runtime_seconds: float = 0.0
-    last_run_at: str | None = None
-    last_returncode: int | None = None
+class GenoaHandler(BaseHTTPRequestHandler):
+    server_version = "genoa-sidecar/1.0"
 
-    @property
-    def success_rate(self) -> float:
-        return self.success_runs / self.total_runs if self.total_runs else 0.0
+    def do_GET(self) -> None:
+        if self.path == "/healthz":
+            self._send_json(HTTPStatus.OK, {"status": "ok"})
+            return
+        self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
+    def do_POST(self) -> None:
+        if self.path != "/api/v1/splat/run":
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            return
 
-app = Flask(__name__)
-stats = RunStats()
-stats_lock = threading.Lock()
+        length = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(length)
 
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid json: {exc}"})
+            return
 
-def build_splat_command(payload: dict) -> list[str] | str:
-    tx_qth = payload.get("tx_qth")
-    if not tx_qth:
-        return "tx_qth is required"
-    cmd = [SPLAT_BIN, "-t", str(tx_qth)]
-    if payload.get("rx_qth"):
-        cmd.extend(["-r", str(payload["rx_qth"])])
-    if payload.get("output_base"):
-        cmd.extend(["-o", str(payload["output_base"])])
-    for flag in payload.get("flags", []):
-        cmd.append(str(flag))
-    return cmd
+        command = self._build_command(payload)
+        if isinstance(command, str):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": command})
+            return
 
+        try:
+            result = subprocess.run(
+                command,
+                cwd=WORKDIR,
+                capture_output=True,
+                text=True,
+                timeout=int(payload.get("timeout_seconds", 120)),
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            self._send_json(HTTPStatus.REQUEST_TIMEOUT, {"error": "splat run timed out"})
+            return
 
-def update_stats(returncode: int, runtime_seconds: float) -> None:
-    with stats_lock:
-        prev_sum = stats.avg_runtime_seconds * stats.total_runs
-        stats.total_runs += 1
-        if returncode == 0:
-            stats.success_runs += 1
-        else:
-            stats.failed_runs += 1
-        stats.avg_runtime_seconds = (prev_sum + runtime_seconds) / stats.total_runs
-        stats.last_run_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        stats.last_returncode = returncode
-
-
-@app.get("/")
-@app.get("/dashboard")
-def dashboard():
-    if not DASHBOARD.exists():
-        return jsonify({"error": "dashboard missing"}), 404
-    return send_file(DASHBOARD)
-
-
-@app.get("/healthz")
-@app.get("/readyz")
-def healthz():
-    return jsonify({"status": "ok"})
-
-
-@app.get("/api/v1/stats")
-def get_stats():
-    with stats_lock:
-        body = asdict(stats)
-        body["success_rate"] = stats.success_rate
-    return jsonify(body)
-
-
-@app.post("/api/v1/splat/run")
-def run_splat():
-    payload = request.get_json(silent=True)
-    if not payload:
-        return jsonify({"error": "request body is required"}), 400
-
-    command = build_splat_command(payload)
-    if isinstance(command, str):
-        return jsonify({"error": command}), 400
-
-    timeout_seconds = int(payload.get("timeout_seconds", 120))
-    start = time.time()
-    try:
-        result = subprocess.run(
-            command,
-            cwd=WORKDIR,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "command": command,
+                "command_string": shlex.join(command),
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            },
         )
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "splat run timed out"}), 408
 
-    runtime_seconds = time.time() - start
-    update_stats(result.returncode, runtime_seconds)
+    def _build_command(self, payload: dict) -> list[str] | str:
+        tx_qth = payload.get("tx_qth")
+        if not tx_qth:
+            return "tx_qth is required"
 
-    return jsonify(
-        {
-            "command": command,
-            "command_string": shlex.join(command),
-            "returncode": result.returncode,
-            "runtime_seconds": runtime_seconds,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        }
-    )
+        command = [SPLAT_BIN, "-t", str(tx_qth)]
+
+        rx_qth = payload.get("rx_qth")
+        if rx_qth:
+            command.extend(["-r", str(rx_qth)])
+
+        output = payload.get("output_base")
+        if output:
+            command.extend(["-o", str(output)])
+
+        for flag in payload.get("flags", []):
+            command.append(str(flag))
+
+        return command
+
+    def log_message(self, format: str, *args) -> None:
+        return
+
+    def _send_json(self, status: HTTPStatus, body: dict) -> None:
+        data = json.dumps(body).encode("utf-8")
+        self.send_response(status.value)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
 
 if __name__ == "__main__":
     WORKDIR.mkdir(parents=True, exist_ok=True)
-    app.run(host=HOST, port=PORT)
+    server = ThreadingHTTPServer((HOST, PORT), GenoaHandler)
+    print(f"Genoa sidecar listening on http://{HOST}:{PORT} (workdir={WORKDIR})")
+    server.serve_forever()
