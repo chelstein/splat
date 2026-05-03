@@ -179,6 +179,13 @@ updated `Dockerfile` now compiles SPLAT! from source in a builder stage and
 copies the generated binary into the runtime image.
 
 Important: in `.do-app.yaml`, `source_dir` must be `.` (not `/`) so Docker build context is the repository root.
+Container runtime now uses Flask + Gunicorn for the Genoa sidecar service.
+The Docker image installs dependencies from `requirements.txt` and starts with:
+
+	gunicorn --bind 0.0.0.0:${PORT:-8080} genoa_sidecar:app
+
+This matches App Platform's `PORT` convention and avoids path assumptions like
+`/splat` subdirectories.
 If deployment failed because the image build could not find `/app/splat`, the
 updated `Dockerfile` now compiles SPLAT! from source in a builder stage and
 copies the generated binary into the runtime image.
