@@ -4,15 +4,18 @@
 Flask + gunicorn version (so the DigitalOcean App Platform CMD
 `gunicorn genoa_sidecar:app` can bind directly).  Routes:
 
-  GET  /healthz                       -> {"status": "ok"}                 (always open)
-  GET  /version                       -> sidecar metadata + git SHA + SPLAT version  (always open)
-  GET  /api/v1/stats                  -> per-worker run counters           (always open)
-  POST /api/v1/splat/run              -> runs ./splat with the given args  (auth-gated when GENOA_API_TOKEN is set)
-  GET  /api/v1/artifacts              -> list files in WORKDIR              (auth-gated when GENOA_API_TOKEN is set)
-  GET  /api/v1/artifacts/<path>       -> fetch a file from WORKDIR         (auth-gated when GENOA_API_TOKEN is set)
+  GET    /healthz                       -> {"status": "ok"}                 (always open)
+  GET    /version                       -> sidecar metadata + git SHA + SPLAT version  (always open)
+  GET    /api/v1/stats                  -> per-worker run counters           (always open)
+  POST   /api/v1/splat/run              -> runs ./splat with the given args  (auth-gated when GENOA_API_TOKEN is set)
+  GET    /api/v1/artifacts              -> list files in WORKDIR              (auth-gated)
+  GET    /api/v1/artifacts/<path>       -> fetch a file from WORKDIR         (auth-gated)
+  GET    /api/v1/sdf                    -> list SPLAT terrain (.sdf/.sdz) tiles  (auth-gated)
+  POST   /api/v1/sdf/<name>             -> upload an .sdf/.sdz tile           (auth-gated)
+  DELETE /api/v1/sdf/<name>             -> remove an .sdf/.sdz tile           (auth-gated)
 
-Auth: opt-in.  If GENOA_API_TOKEN is unset, the run/artifact endpoints
-are open (backward compatible).  If set, callers must send
+Auth: opt-in.  If GENOA_API_TOKEN is unset, the run/artifact/sdf
+endpoints are open (backward compatible).  If set, callers must send
   Authorization: Bearer <token>
 or receive 401.  Read-only health endpoints (/healthz, /version,
 /api/v1/stats) remain unauthenticated so platform health checks and
@@ -21,8 +24,12 @@ dashboards work without a token.
 Path confinement: regardless of auth, every path-like field on the run
 payload (`tx_qth`, `rx_qth`, `output_base`) and the artifact path must
 resolve INSIDE WORKDIR after Path.resolve(); otherwise the request is
-rejected 400/404.  Even an authenticated caller cannot direct SPLAT to
-read or write arbitrary filesystem paths via these fields.
+rejected 400/404.  SDF tile names must be a single filename (no path
+separators, no `..`) and must end with `.sdf` or `.sdz`.
+
+SDF directory layout: tiles live under WORKDIR/sdf/.  The sweeper
+exempts that subdir so terrain data persists.  Callers running SPLAT
+should pass `-d sdf` in `flags` so SPLAT finds the tiles.
 
 The SPLAT binary is invoked via subprocess against `WORKDIR`.  The
 container is expected to have already built `./splat` (Dockerfile runs
@@ -30,14 +37,16 @@ container is expected to have already built `./splat` (Dockerfile runs
 
 Lifecycle: a background thread sweeps stale files out of WORKDIR every
 GENOA_SWEEP_INTERVAL_SECONDS (default 3600). Files older than
-GENOA_RETENTION_HOURS (default 24) are deleted. Set retention to 0 to
-disable the sweeper.
+GENOA_RETENTION_HOURS (default 24) are deleted, EXCEPT for files under
+sample_data/ (image fixtures) and sdf/ (terrain tiles).  Set retention
+to 0 to disable the sweeper.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import secrets
 import shlex
 import subprocess
@@ -58,12 +67,23 @@ SPLAT_BIN = os.getenv("SPLAT_BIN", "./splat")
 WORKDIR = Path(os.getenv("SPLAT_WORKDIR", ".")).resolve()
 WORKDIR.mkdir(parents=True, exist_ok=True)
 
+SDF_DIR_NAME = "sdf"
+SDF_DIR = (WORKDIR / SDF_DIR_NAME).resolve()
+SDF_DIR.mkdir(parents=True, exist_ok=True)
+
+# Sweeper-exempt top-level directories.  Anything under these is
+# preserved regardless of mtime (sample_data/ are shipped fixtures;
+# sdf/ is operator-uploaded terrain).
+SWEEPER_EXEMPT_DIRS = ("sample_data", SDF_DIR_NAME)
+
 GIT_COMMIT_SHA = os.getenv("GIT_COMMIT_SHA", "unknown")
 BUILD_TIME     = os.getenv("BUILD_TIME", "unknown")
 RETENTION_HOURS = float(os.getenv("GENOA_RETENTION_HOURS", "24"))
 SWEEP_INTERVAL_SECONDS = float(os.getenv("GENOA_SWEEP_INTERVAL_SECONDS", "3600"))
+SDF_MAX_UPLOAD_BYTES = int(os.getenv("GENOA_SDF_MAX_UPLOAD_BYTES", str(64 * 1024 * 1024)))
 
 app = Flask("genoa-sidecar")
+app.config["MAX_CONTENT_LENGTH"] = SDF_MAX_UPLOAD_BYTES
 
 
 def _detect_splat_version() -> str:
@@ -136,11 +156,7 @@ _stats = RunStats()
 # ---------- Auth ----------
 
 def _configured_token() -> Optional[str]:
-    """Return the configured bearer token, or None if auth is disabled.
-
-    Read at request time so operators can rotate the token without
-    restarting the container.
-    """
+    """Return the configured bearer token, or None if auth is disabled."""
     tok = (os.getenv("GENOA_API_TOKEN") or "").strip()
     return tok or None
 
@@ -182,8 +198,34 @@ def _flag_has_traversal(flag: object) -> bool:
     return False
 
 
+# ---------- SDF naming ----------
+
+# SPLAT tile filenames are conventionally `<lat_lo>:<lat_hi>:<lon_lo>:<lon_hi>.sdf`
+# with an optional `.sdz` (gzip) variant.  We accept any safe filename
+# ending with .sdf or .sdz; structural validation belongs to SPLAT itself.
+_SDF_NAME_RE = re.compile(r"^[A-Za-z0-9._:+\-]{1,80}\.(sdf|sdz)$")
+
+
+def _validate_sdf_name(name: Optional[str]) -> Optional[str]:
+    """Returns None if `name` is a safe SDF filename, else an error string."""
+    if not name:
+        return "name is required"
+    if "/" in name or "\\" in name:
+        return "name must not contain path separators"
+    if ".." in name:
+        return "name must not contain '..'"
+    if not _SDF_NAME_RE.match(name):
+        return "name must match [A-Za-z0-9._:+\\-]{1,80}\\.(sdf|sdz)"
+    return None
+
+
 def sweep_workdir(workdir: Path, retention_hours: float, *, now: Optional[float] = None) -> int:
-    """Delete files in `workdir` whose mtime is older than retention_hours."""
+    """Delete files in `workdir` whose mtime is older than retention_hours.
+
+    Files under the SWEEPER_EXEMPT_DIRS (sample_data/, sdf/) are
+    preserved regardless of mtime — they're long-lived terrain data
+    and image fixtures, not run output.
+    """
     if retention_hours <= 0:
         return 0
     cutoff = (now if now is not None else time.time()) - retention_hours * 3600.0
@@ -195,7 +237,7 @@ def sweep_workdir(workdir: Path, retention_hours: float, *, now: Optional[float]
             rel = path.relative_to(workdir)
         except ValueError:
             continue
-        if rel.parts and rel.parts[0] == "sample_data":
+        if rel.parts and rel.parts[0] in SWEEPER_EXEMPT_DIRS:
             continue
         try:
             if path.stat().st_mtime < cutoff:
@@ -226,8 +268,8 @@ def _start_sweeper() -> None:
     t = threading.Thread(target=_sweeper_loop, name="genoa-sweeper", daemon=True)
     t.start()
     log.info(
-        "workdir sweeper started (retention=%.1fh interval=%.0fs workdir=%s)",
-        RETENTION_HOURS, SWEEP_INTERVAL_SECONDS, WORKDIR,
+        "workdir sweeper started (retention=%.1fh interval=%.0fs workdir=%s exempt=%s)",
+        RETENTION_HOURS, SWEEP_INTERVAL_SECONDS, WORKDIR, SWEEPER_EXEMPT_DIRS,
     )
 
 
@@ -247,6 +289,7 @@ def version():
         "splat_bin":      SPLAT_BIN,
         "splat_version":  SPLAT_VERSION,
         "workdir":        str(WORKDIR),
+        "sdf_dir":        SDF_DIR_NAME,
         "auth_required":  _configured_token() is not None,
     })
 
@@ -307,16 +350,7 @@ def splat_run():
 
 @app.get("/api/v1/artifacts")
 def artifacts_list():
-    """List files in WORKDIR (excluding sample_data/), newest first.
-
-    Each entry has { path, size_bytes, modified_at, url }.  The url is
-    a relative path that the caller can append to the sidecar's base
-    URL to fetch the file via /api/v1/artifacts/<path>.
-
-    Auth-gated when GENOA_API_TOKEN is set.  Stat'ing every file in a
-    huge WORKDIR can be slow; the sweeper bounds disk usage so this
-    endpoint stays responsive in practice.
-    """
+    """List files in WORKDIR (excluding sample_data/ and sdf/), newest first."""
     if not _is_authorized(request):
         return jsonify({"error": "unauthorized"}), 401
 
@@ -328,9 +362,7 @@ def artifacts_list():
             rel = path.relative_to(WORKDIR)
         except ValueError:
             continue
-        # Skip sample_data fixtures — same convention as the sweeper.
-        # Operators can still GET them by path if needed.
-        if rel.parts and rel.parts[0] == "sample_data":
+        if rel.parts and rel.parts[0] in SWEEPER_EXEMPT_DIRS:
             continue
         try:
             stat = path.stat()
@@ -353,12 +385,7 @@ def artifacts_list():
 
 @app.get("/api/v1/artifacts/<path:filename>")
 def artifacts_get(filename):
-    """Fetch a file from WORKDIR.
-
-    Path-confined: the requested filename must resolve inside WORKDIR.
-    Otherwise 400.  Missing files return 404.  Auth-gated when
-    GENOA_API_TOKEN is set.
-    """
+    """Fetch a file from WORKDIR.  Path-confined.  Auth-gated."""
     if not _is_authorized(request):
         return jsonify({"error": "unauthorized"}), 401
     if not _path_inside_workdir(filename):
@@ -366,9 +393,112 @@ def artifacts_get(filename):
     target = (WORKDIR / filename).resolve()
     if not target.is_file():
         return jsonify({"error": "not found"}), 404
-    # send_from_directory does its own path containment check on top
-    # of ours; both belt and suspenders here is intentional.
     return send_from_directory(str(WORKDIR), filename, as_attachment=False)
+
+
+# ---------- SDF terrain tile lifecycle ----------
+
+@app.get("/api/v1/sdf")
+def sdf_list():
+    """List SPLAT terrain tiles in WORKDIR/sdf/."""
+    if not _is_authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    tiles = []
+    if SDF_DIR.is_dir():
+        for path in SDF_DIR.iterdir():
+            if not path.is_file():
+                continue
+            if path.suffix not in (".sdf", ".sdz"):
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            tiles.append({
+                "name":        path.name,
+                "size_bytes":  stat.st_size,
+                "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(timespec="seconds"),
+                "url":         f"/api/v1/artifacts/{SDF_DIR_NAME}/{path.name}",
+            })
+    tiles.sort(key=lambda t: t["name"])
+    return jsonify({
+        "sdf_dir":              SDF_DIR_NAME,
+        "max_upload_bytes":     SDF_MAX_UPLOAD_BYTES,
+        "count":                len(tiles),
+        "tiles":                tiles,
+    })
+
+
+@app.post("/api/v1/sdf/<name>")
+def sdf_upload(name):
+    """Upload an .sdf or .sdz tile.
+
+    Body may be:
+      - raw application/octet-stream bytes (no multipart wrapping), OR
+      - multipart/form-data with a single 'file' field.
+
+    Overwrites any existing tile of the same name (operators rely on
+    this to refresh stale terrain).  Auth-gated when GENOA_API_TOKEN
+    is set.  Body size is capped by GENOA_SDF_MAX_UPLOAD_BYTES (default
+    64 MiB); exceeding it returns 413.
+    """
+    if not _is_authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    err = _validate_sdf_name(name)
+    if err:
+        return jsonify({"error": err}), 400
+
+    SDF_DIR.mkdir(parents=True, exist_ok=True)
+    target = (SDF_DIR / name).resolve()
+    # Defense in depth: confirm target is inside SDF_DIR even after
+    # resolve()/symlink chasing.  _validate_sdf_name should have
+    # blocked any traversal already, but check again.
+    try:
+        target.relative_to(SDF_DIR)
+    except ValueError:
+        return jsonify({"error": "name resolves outside SDF dir"}), 400
+
+    # Accept either a multipart upload (single 'file' field) or a raw body.
+    upload = request.files.get("file") if request.files else None
+    if upload is not None:
+        upload.save(str(target))
+    else:
+        data = request.get_data(cache=False)
+        if not data:
+            return jsonify({"error": "request body is empty"}), 400
+        target.write_bytes(data)
+
+    stat = target.stat()
+    return jsonify({
+        "name":        name,
+        "size_bytes":  stat.st_size,
+        "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(timespec="seconds"),
+        "url":         f"/api/v1/artifacts/{SDF_DIR_NAME}/{name}",
+    }), 201
+
+
+@app.delete("/api/v1/sdf/<name>")
+def sdf_delete(name):
+    """Remove an SDF tile.  404 if missing.  Auth-gated."""
+    if not _is_authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    err = _validate_sdf_name(name)
+    if err:
+        return jsonify({"error": err}), 400
+
+    target = (SDF_DIR / name).resolve()
+    try:
+        target.relative_to(SDF_DIR)
+    except ValueError:
+        return jsonify({"error": "name resolves outside SDF dir"}), 400
+
+    if not target.is_file():
+        return jsonify({"error": "not found"}), 404
+    target.unlink()
+    return jsonify({"deleted": name})
 
 
 def _build_command(payload: dict) -> Union[list, str]:

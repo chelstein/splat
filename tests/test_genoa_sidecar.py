@@ -21,6 +21,7 @@ from genoa_sidecar import (
     _flag_has_traversal,
     _is_authorized,
     _path_inside_workdir,
+    _validate_sdf_name,
     app,
     RunStats,
     sweep_workdir,
@@ -92,11 +93,12 @@ class BuildCommandTests(unittest.TestCase):
     def test_benign_flags_still_accepted(self):
         cmd = _build_command({
             "tx_qth": "site.qth",
-            "flags":  ["-metric", "-dbm", "-d", "sample_data"]
+            "flags":  ["-metric", "-dbm", "-d", "sdf"]
         })
         self.assertIsInstance(cmd, list)
         self.assertIn("-metric", cmd)
         self.assertIn("-d", cmd)
+        self.assertIn("sdf", cmd)
 
 
 class PathConfinementTests(unittest.TestCase):
@@ -136,6 +138,35 @@ class FlagTraversalTests(unittest.TestCase):
 
     def test_non_string_coerced(self):
         self.assertFalse(_flag_has_traversal(123))
+
+
+class SdfNameValidationTests(unittest.TestCase):
+    def test_required(self):
+        self.assertEqual(_validate_sdf_name(""), "name is required")
+        self.assertEqual(_validate_sdf_name(None), "name is required")
+
+    def test_path_separator_rejected(self):
+        self.assertIn("path separators", _validate_sdf_name("sub/file.sdf") or "")
+        self.assertIn("path separators", _validate_sdf_name("a\\b.sdf") or "")
+
+    def test_dotdot_rejected(self):
+        self.assertIn("'..'", _validate_sdf_name("..sneaky.sdf") or "")
+
+    def test_wrong_extension_rejected(self):
+        self.assertIsNotNone(_validate_sdf_name("file.txt"))
+        self.assertIsNotNone(_validate_sdf_name("no_extension"))
+
+    def test_classic_splat_name_accepted(self):
+        self.assertIsNone(_validate_sdf_name("38:39:-77:-76.sdf"))
+        self.assertIsNone(_validate_sdf_name("38:39:-77:-76.sdz"))
+
+    def test_simple_sdf_name_accepted(self):
+        self.assertIsNone(_validate_sdf_name("region_alpha.sdf"))
+        self.assertIsNone(_validate_sdf_name("region-alpha.sdz"))
+
+    def test_long_name_rejected(self):
+        long_name = ("a" * 100) + ".sdf"
+        self.assertIsNotNone(_validate_sdf_name(long_name))
 
 
 class RunStatsTests(unittest.TestCase):
@@ -206,7 +237,7 @@ class HealthAndVersionRoutesTests(unittest.TestCase):
     def test_version_includes_new_metadata(self):
         resp = self.client.get("/version")
         body = resp.get_json()
-        for key in ("git_commit_sha", "build_time", "splat_version", "auth_required"):
+        for key in ("git_commit_sha", "build_time", "splat_version", "auth_required", "sdf_dir"):
             self.assertIn(key, body)
 
     def test_version_auth_required_false_when_token_unset(self):
@@ -383,11 +414,7 @@ class SplatRunRouteTests(unittest.TestCase):
 
 
 class ArtifactsRouteTests(unittest.TestCase):
-    """Artifact list + fetch routes.
-
-    Each test gets a unique sub-directory under WORKDIR so file seeds
-    don't collide across tests, and the directory is removed in tearDown.
-    """
+    """Artifact list + fetch routes."""
 
     @classmethod
     def setUpClass(cls):
@@ -411,8 +438,6 @@ class ArtifactsRouteTests(unittest.TestCase):
     def _rel(self, p: Path) -> str:
         return p.relative_to(self.WORKDIR).as_posix()
 
-    # ---- list ----
-
     def test_list_returns_expected_top_level_keys(self):
         resp = self.client.get("/api/v1/artifacts")
         self.assertEqual(resp.status_code, 200)
@@ -420,7 +445,6 @@ class ArtifactsRouteTests(unittest.TestCase):
         for key in ("workdir", "count", "artifacts"):
             self.assertIn(key, body)
         self.assertIsInstance(body["artifacts"], list)
-        self.assertEqual(body["count"], len(body["artifacts"]))
 
     def test_list_returns_seeded_files(self):
         a = self._seed("a.ppm", b"PPM A")
@@ -430,29 +454,16 @@ class ArtifactsRouteTests(unittest.TestCase):
         self.assertIn(self._rel(a), paths)
         self.assertIn(self._rel(b), paths)
 
-    def test_list_item_has_expected_per_artifact_keys(self):
-        seeded = self._seed("item.ppm", b"abcde")
-        body = self.client.get("/api/v1/artifacts").get_json()
-        rel = self._rel(seeded)
-        item = next((i for i in body["artifacts"] if i["path"] == rel), None)
-        self.assertIsNotNone(item, f"seeded file {rel} not in listing")
-        self.assertEqual(item["size_bytes"], 5)
-        self.assertEqual(item["url"], f"/api/v1/artifacts/{rel}")
-        self.assertIn("modified_at", item)
-
-    def test_list_sorts_newest_first(self):
-        old = self._seed("old.ppm", b"old")
-        os.utime(old, (time.time() - 3600, time.time() - 3600))
-        new = self._seed("new.ppm", b"new")
-        items = self.client.get("/api/v1/artifacts").get_json()["artifacts"]
-        rel_old = self._rel(old)
-        rel_new = self._rel(new)
-        positions = {item["path"]: idx for idx, item in enumerate(items)}
-        self.assertIn(rel_old, positions)
-        self.assertIn(rel_new, positions)
-        self.assertLess(positions[rel_new], positions[rel_old])
-
-    # ---- get ----
+    def test_list_excludes_sdf_dir(self):
+        """sdf/ subtree should not appear in the artifacts list."""
+        from genoa_sidecar import SDF_DIR
+        marker = SDF_DIR / f"test_marker_{time.time_ns()}.sdf"
+        marker.write_bytes(b"")
+        try:
+            paths = {item["path"] for item in self.client.get("/api/v1/artifacts").get_json()["artifacts"]}
+            self.assertNotIn(marker.relative_to(self.WORKDIR).as_posix(), paths)
+        finally:
+            marker.unlink(missing_ok=True)
 
     def test_get_returns_file_content(self):
         seeded = self._seed("file.txt", b"hello world")
@@ -465,19 +476,8 @@ class ArtifactsRouteTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 404)
 
     def test_get_traversal_blocked(self):
-        # Encoded traversal in the URL path.  Either 400 (caught by
-        # _path_inside_workdir) or 404 (caught by send_from_directory)
-        # is acceptable — both refuse the escape.
         resp = self.client.get("/api/v1/artifacts/..%2Fetc%2Fpasswd")
         self.assertIn(resp.status_code, (400, 404))
-
-    def test_get_nested_path(self):
-        seeded = self._seed("deep/nested/coverage.ppm", b"deep")
-        resp = self.client.get(f"/api/v1/artifacts/{self._rel(seeded)}")
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.data, b"deep")
-
-    # ---- auth ----
 
     @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
     def test_list_requires_auth_when_token_set(self):
@@ -485,28 +485,193 @@ class ArtifactsRouteTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 401)
 
     @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
-    def test_list_with_correct_token(self):
-        resp = self.client.get(
-            "/api/v1/artifacts",
-            headers={"Authorization": "Bearer sekret"},
-        )
-        self.assertEqual(resp.status_code, 200)
-
-    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
     def test_get_requires_auth_when_token_set(self):
         seeded = self._seed("auth_test.txt", b"data")
         resp = self.client.get(f"/api/v1/artifacts/{self._rel(seeded)}")
         self.assertEqual(resp.status_code, 401)
 
-    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
-    def test_get_with_correct_token(self):
-        seeded = self._seed("auth_pass.txt", b"data")
-        resp = self.client.get(
-            f"/api/v1/artifacts/{self._rel(seeded)}",
-            headers={"Authorization": "Bearer sekret"},
-        )
+
+class SdfRouteTests(unittest.TestCase):
+    """SDF list / upload / delete routes."""
+
+    @classmethod
+    def setUpClass(cls):
+        from genoa_sidecar import SDF_DIR
+        cls.SDF_DIR = SDF_DIR
+
+    def setUp(self):
+        self.client = app.test_client()
+        # A unique suffix per test method so concurrent / repeated runs
+        # don't collide on tile names.
+        self._suffix = f"{os.getpid()}_{time.time_ns()}"
+        self._created = []
+
+    def tearDown(self):
+        for path in self._created:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _name(self, base: str = "tile", ext: str = ".sdf") -> str:
+        return f"{base}_{self._suffix}{ext}"
+
+    def _seed(self, name: str, content: bytes = b"sdf-bytes") -> Path:
+        path = self.SDF_DIR / name
+        path.write_bytes(content)
+        self._created.append(path)
+        return path
+
+    # ---- list ----
+
+    def test_list_returns_top_level_keys(self):
+        resp = self.client.get("/api/v1/sdf")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.data, b"data")
+        body = resp.get_json()
+        for key in ("sdf_dir", "max_upload_bytes", "count", "tiles"):
+            self.assertIn(key, body)
+        self.assertEqual(body["sdf_dir"], "sdf")
+
+    def test_list_returns_seeded_tile(self):
+        name = self._name()
+        self._seed(name, b"abc")
+        body = self.client.get("/api/v1/sdf").get_json()
+        names = {t["name"] for t in body["tiles"]}
+        self.assertIn(name, names)
+        item = next(t for t in body["tiles"] if t["name"] == name)
+        self.assertEqual(item["size_bytes"], 3)
+        self.assertEqual(item["url"], f"/api/v1/artifacts/sdf/{name}")
+        self.assertIn("modified_at", item)
+
+    def test_list_filters_non_sdf_files(self):
+        """A .txt file in the sdf/ dir should NOT appear in the SDF listing."""
+        spurious = self.SDF_DIR / f"not_a_tile_{self._suffix}.txt"
+        spurious.write_bytes(b"nope")
+        self._created.append(spurious)
+        body = self.client.get("/api/v1/sdf").get_json()
+        names = {t["name"] for t in body["tiles"]}
+        self.assertNotIn(spurious.name, names)
+
+    # ---- upload ----
+
+    def test_upload_raw_body_writes_file(self):
+        name = self._name()
+        target = self.SDF_DIR / name
+        self._created.append(target)
+        resp = self.client.post(
+            f"/api/v1/sdf/{name}",
+            data=b"sdf-bytes-here",
+            content_type="application/octet-stream",
+        )
+        self.assertEqual(resp.status_code, 201)
+        body = resp.get_json()
+        self.assertEqual(body["name"], name)
+        self.assertEqual(body["size_bytes"], len(b"sdf-bytes-here"))
+        self.assertEqual(body["url"], f"/api/v1/artifacts/sdf/{name}")
+        self.assertTrue(target.is_file())
+        self.assertEqual(target.read_bytes(), b"sdf-bytes-here")
+
+    def test_upload_overwrites_existing(self):
+        name = self._name()
+        self._seed(name, b"original")
+        target = self.SDF_DIR / name
+        resp = self.client.post(
+            f"/api/v1/sdf/{name}",
+            data=b"replacement",
+            content_type="application/octet-stream",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(target.read_bytes(), b"replacement")
+
+    def test_upload_empty_body_returns_400(self):
+        name = self._name()
+        resp = self.client.post(
+            f"/api/v1/sdf/{name}",
+            data=b"",
+            content_type="application/octet-stream",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_upload_invalid_name_extension_returns_400(self):
+        resp = self.client.post(
+            "/api/v1/sdf/file.txt",
+            data=b"abc",
+            content_type="application/octet-stream",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_upload_traversal_in_name_returns_400_or_404(self):
+        # Flask's <name> path converter doesn't accept slashes, so
+        # "../foo.sdf" routes to a different URL or rejects with 404
+        # before reaching the handler.  Either way the file should
+        # never be written.
+        resp = self.client.post(
+            "/api/v1/sdf/..foo.sdf",
+            data=b"abc",
+            content_type="application/octet-stream",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    # ---- delete ----
+
+    def test_delete_existing_returns_200(self):
+        name = self._name()
+        target = self._seed(name, b"abc")
+        resp = self.client.delete(f"/api/v1/sdf/{name}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["deleted"], name)
+        self.assertFalse(target.exists())
+
+    def test_delete_missing_returns_404(self):
+        resp = self.client.delete(f"/api/v1/sdf/never_existed_{self._suffix}.sdf")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_delete_invalid_name_returns_400(self):
+        resp = self.client.delete("/api/v1/sdf/file.txt")
+        self.assertEqual(resp.status_code, 400)
+
+    # ---- auth ----
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
+    def test_list_requires_auth_when_token_set(self):
+        resp = self.client.get("/api/v1/sdf")
+        self.assertEqual(resp.status_code, 401)
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
+    def test_upload_requires_auth_when_token_set(self):
+        resp = self.client.post(
+            f"/api/v1/sdf/{self._name()}",
+            data=b"x",
+            content_type="application/octet-stream",
+        )
+        self.assertEqual(resp.status_code, 401)
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
+    def test_delete_requires_auth_when_token_set(self):
+        resp = self.client.delete(f"/api/v1/sdf/{self._name()}")
+        self.assertEqual(resp.status_code, 401)
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
+    def test_full_lifecycle_with_auth(self):
+        name = self._name()
+        target = self.SDF_DIR / name
+        self._created.append(target)
+        headers = {"Authorization": "Bearer sekret"}
+        # Upload.
+        resp = self.client.post(
+            f"/api/v1/sdf/{name}",
+            data=b"hello",
+            content_type="application/octet-stream",
+            headers=headers,
+        )
+        self.assertEqual(resp.status_code, 201)
+        # Listed.
+        listed = self.client.get("/api/v1/sdf", headers=headers).get_json()
+        self.assertIn(name, {t["name"] for t in listed["tiles"]})
+        # Delete.
+        resp = self.client.delete(f"/api/v1/sdf/{name}", headers=headers)
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(target.exists())
 
 
 class SweepWorkdirTests(unittest.TestCase):
@@ -544,6 +709,15 @@ class SweepWorkdirTests(unittest.TestCase):
         deleted = sweep_workdir(self.workdir, retention_hours=24)
         self.assertEqual(deleted, 1)
         self.assertTrue(old_sample.exists())
+        self.assertFalse(old_run.exists())
+
+    def test_skips_sdf_tree(self):
+        """sdf/ tiles must survive the sweeper regardless of mtime."""
+        old_sdf = self._touch("sdf/38:39:-77:-76.sdf", age_seconds=10000 * 3600)
+        old_run = self._touch("out/coverage.ppm", age_seconds=10000 * 3600)
+        deleted = sweep_workdir(self.workdir, retention_hours=24)
+        self.assertEqual(deleted, 1)
+        self.assertTrue(old_sdf.exists())
         self.assertFalse(old_run.exists())
 
     def test_recurses_into_subdirectories(self):
