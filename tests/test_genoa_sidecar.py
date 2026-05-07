@@ -15,7 +15,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from genoa_sidecar import _build_command, app, RunStats, sweep_workdir
+from genoa_sidecar import (
+    _build_command,
+    _flag_has_traversal,
+    _is_authorized,
+    _path_inside_workdir,
+    app,
+    RunStats,
+    sweep_workdir,
+)
 
 
 class BuildCommandTests(unittest.TestCase):
@@ -41,6 +49,98 @@ class BuildCommandTests(unittest.TestCase):
     def test_flag_values_are_coerced_to_str(self):
         cmd = _build_command({"tx_qth": "x", "flags": [123]})
         self.assertEqual(cmd[-1], "123")
+
+    # ---- path confinement (validation gate) ----
+
+    def test_tx_qth_traversal_rejected(self):
+        err = _build_command({"tx_qth": "../etc/passwd"})
+        self.assertIsInstance(err, str)
+        self.assertIn("tx_qth", err)
+        self.assertIn("WORKDIR", err)
+
+    def test_absolute_tx_qth_rejected(self):
+        err = _build_command({"tx_qth": "/etc/passwd"})
+        self.assertIsInstance(err, str)
+        self.assertIn("tx_qth", err)
+
+    def test_rx_qth_traversal_rejected(self):
+        err = _build_command({"tx_qth": "site.qth", "rx_qth": "../../etc/host"})
+        self.assertIsInstance(err, str)
+        self.assertIn("rx_qth", err)
+
+    def test_output_base_traversal_rejected(self):
+        err = _build_command({"tx_qth": "site.qth", "output_base": "../foo.ppm"})
+        self.assertIsInstance(err, str)
+        self.assertIn("output_base", err)
+
+    def test_relative_paths_inside_workdir_pass(self):
+        cmd = _build_command({
+            "tx_qth":      "sample_data/wnju-dt.qth",
+            "output_base": "out/region/coverage",
+        })
+        self.assertIsInstance(cmd, list)
+
+    # ---- flag traversal guard ----
+
+    def test_flag_dotdot_rejected(self):
+        err = _build_command({"tx_qth": "site.qth", "flags": ["-o", "../sneaky"]})
+        self.assertIsInstance(err, str)
+        self.assertIn("path traversal", err)
+
+    def test_flag_absolute_rejected(self):
+        err = _build_command({"tx_qth": "site.qth", "flags": ["-o", "/etc/foo"]})
+        self.assertIsInstance(err, str)
+        self.assertIn("path traversal", err)
+
+    def test_benign_flags_still_accepted(self):
+        cmd = _build_command({
+            "tx_qth": "site.qth",
+            "flags":  ["-metric", "-dbm", "-d", "sample_data"]
+        })
+        self.assertIsInstance(cmd, list)
+        self.assertIn("-metric", cmd)
+        self.assertIn("-d", cmd)
+
+
+class PathConfinementTests(unittest.TestCase):
+    """Direct tests on _path_inside_workdir helper."""
+
+    def test_none_and_empty_pass(self):
+        self.assertTrue(_path_inside_workdir(None))
+        self.assertTrue(_path_inside_workdir(""))
+
+    def test_simple_relative_passes(self):
+        self.assertTrue(_path_inside_workdir("foo.qth"))
+        self.assertTrue(_path_inside_workdir("sub/foo.qth"))
+
+    def test_dotdot_rejected(self):
+        self.assertFalse(_path_inside_workdir("../escape"))
+        self.assertFalse(_path_inside_workdir("sub/../../escape"))
+
+    def test_absolute_outside_workdir_rejected(self):
+        self.assertFalse(_path_inside_workdir("/etc/passwd"))
+        self.assertFalse(_path_inside_workdir("/tmp/foo"))
+
+    def test_absolute_inside_workdir_passes(self):
+        from genoa_sidecar import WORKDIR
+        self.assertTrue(_path_inside_workdir(str(WORKDIR / "foo.qth")))
+
+
+class FlagTraversalTests(unittest.TestCase):
+    def test_dotdot(self):
+        self.assertTrue(_flag_has_traversal("../foo"))
+        self.assertTrue(_flag_has_traversal("a/../b"))
+
+    def test_absolute(self):
+        self.assertTrue(_flag_has_traversal("/etc/foo"))
+
+    def test_benign_flag(self):
+        self.assertFalse(_flag_has_traversal("-metric"))
+        self.assertFalse(_flag_has_traversal("-dbm"))
+        self.assertFalse(_flag_has_traversal("out/foo"))
+
+    def test_non_string_coerced(self):
+        self.assertFalse(_flag_has_traversal(123))
 
 
 class RunStatsTests(unittest.TestCase):
@@ -92,7 +192,7 @@ class RunStatsTests(unittest.TestCase):
 
 
 class HealthAndVersionRoutesTests(unittest.TestCase):
-    """Pin the /healthz and /version contracts."""
+    """Pin /healthz and /version contracts."""
 
     def setUp(self):
         self.client = app.test_client()
@@ -103,7 +203,6 @@ class HealthAndVersionRoutesTests(unittest.TestCase):
         self.assertEqual(resp.get_json(), {"status": "ok"})
 
     def test_version_includes_legacy_keys(self):
-        """Existing callers may key off these. Keep them."""
         resp = self.client.get("/version")
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
@@ -114,8 +213,35 @@ class HealthAndVersionRoutesTests(unittest.TestCase):
     def test_version_includes_new_metadata(self):
         resp = self.client.get("/version")
         body = resp.get_json()
-        for key in ("git_commit_sha", "build_time", "splat_version"):
+        for key in ("git_commit_sha", "build_time", "splat_version", "auth_required"):
             self.assertIn(key, body)
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": ""}, clear=False)
+    def test_version_auth_required_false_when_token_unset(self):
+        os.environ.pop("GENOA_API_TOKEN", None)
+        resp = self.client.get("/version")
+        self.assertFalse(resp.get_json()["auth_required"])
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
+    def test_version_auth_required_true_when_token_set(self):
+        resp = self.client.get("/version")
+        self.assertTrue(resp.get_json()["auth_required"])
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
+    def test_healthz_unauthenticated_with_token_set(self):
+        """Health checks must work without a token even when auth is on."""
+        resp = self.client.get("/healthz")
+        self.assertEqual(resp.status_code, 200)
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
+    def test_version_unauthenticated_with_token_set(self):
+        resp = self.client.get("/version")
+        self.assertEqual(resp.status_code, 200)
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
+    def test_stats_unauthenticated_with_token_set(self):
+        resp = self.client.get("/api/v1/stats")
+        self.assertEqual(resp.status_code, 200)
 
 
 class StatsRouteTests(unittest.TestCase):
@@ -131,6 +257,44 @@ class StatsRouteTests(unittest.TestCase):
             self.assertIn(key, body)
         self.assertIsInstance(body["total_runs"], int)
         self.assertIsInstance(body["success_rate"], (int, float))
+
+
+class IsAuthorizedTests(unittest.TestCase):
+    """Direct tests on _is_authorized helper."""
+
+    def _req(self, headers=None):
+        class Req:
+            pass
+        r = Req()
+        r.headers = headers or {}
+        return r
+
+    def test_no_token_configured_passes(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GENOA_API_TOKEN", None)
+            self.assertTrue(_is_authorized(self._req()))
+            self.assertTrue(_is_authorized(self._req({"Authorization": "Bearer anything"})))
+
+    def test_empty_token_configured_passes(self):
+        with mock.patch.dict(os.environ, {"GENOA_API_TOKEN": ""}):
+            self.assertTrue(_is_authorized(self._req()))
+
+    def test_correct_token_passes(self):
+        with mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"}):
+            self.assertTrue(_is_authorized(self._req({"Authorization": "Bearer sekret"})))
+
+    def test_wrong_token_fails(self):
+        with mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"}):
+            self.assertFalse(_is_authorized(self._req({"Authorization": "Bearer wrong"})))
+
+    def test_missing_header_fails(self):
+        with mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"}):
+            self.assertFalse(_is_authorized(self._req()))
+
+    def test_wrong_scheme_fails(self):
+        with mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"}):
+            self.assertFalse(_is_authorized(self._req({"Authorization": "Basic sekret"})))
+            self.assertFalse(_is_authorized(self._req({"Authorization": "sekret"})))
 
 
 class SplatRunRouteTests(unittest.TestCase):
@@ -180,10 +344,61 @@ class SplatRunRouteTests(unittest.TestCase):
         after = self.client.get("/api/v1/stats").get_json()["failure_count"]
         self.assertEqual(after, before + 1)
 
+    # ---- auth gating on the run endpoint ----
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
+    def test_run_without_auth_header_returns_401(self):
+        resp = self.client.post("/api/v1/splat/run", json={"tx_qth": "x.qth"})
+        self.assertEqual(resp.status_code, 401)
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
+    def test_run_with_wrong_token_returns_401(self):
+        resp = self.client.post(
+            "/api/v1/splat/run",
+            json={"tx_qth": "x.qth"},
+            headers={"Authorization": "Bearer wrong"},
+        )
+        self.assertEqual(resp.status_code, 401)
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
+    @mock.patch("genoa_sidecar.subprocess.run")
+    def test_run_with_correct_token_returns_200(self, mock_run):
+        mock_run.return_value = mock.Mock(returncode=0, stdout="ok", stderr="")
+        resp = self.client.post(
+            "/api/v1/splat/run",
+            json={"tx_qth": "x.qth"},
+            headers={"Authorization": "Bearer sekret"},
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    # ---- path confinement at the route level ----
+
+    def test_run_with_traversal_in_tx_qth_returns_400(self):
+        resp = self.client.post(
+            "/api/v1/splat/run",
+            json={"tx_qth": "../etc/passwd"},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("WORKDIR", resp.get_json()["error"])
+
+    def test_run_with_absolute_output_base_returns_400(self):
+        resp = self.client.post(
+            "/api/v1/splat/run",
+            json={"tx_qth": "x.qth", "output_base": "/etc/foo"},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("output_base", resp.get_json()["error"])
+
+    def test_run_with_traversal_flag_returns_400(self):
+        resp = self.client.post(
+            "/api/v1/splat/run",
+            json={"tx_qth": "x.qth", "flags": ["-o", "../sneaky"]},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("path traversal", resp.get_json()["error"])
+
 
 class SweepWorkdirTests(unittest.TestCase):
-    """Pure-function tests for the workdir sweeper. No threads, no time.sleep."""
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.workdir = Path(self._tmp.name)
@@ -213,7 +428,6 @@ class SweepWorkdirTests(unittest.TestCase):
         self.assertTrue(fresh.exists())
 
     def test_skips_sample_data_tree(self):
-        """Reference fixtures shipped with the image are not run output."""
         old_sample = self._touch("sample_data/wnju-dt.qth", age_seconds=10000 * 3600)
         old_run = self._touch("out/coverage.ppm", age_seconds=10000 * 3600)
         deleted = sweep_workdir(self.workdir, retention_hours=24)
@@ -228,10 +442,8 @@ class SweepWorkdirTests(unittest.TestCase):
 
     def test_now_argument_is_deterministic(self):
         path = self._touch("x.ppm", age_seconds=10 * 3600)
-        # With now = current time, this 10h-old file is younger than 24h retention -> kept.
         deleted = sweep_workdir(self.workdir, retention_hours=24, now=time.time())
         self.assertEqual(deleted, 0)
-        # With now = current time + 100h, that same file looks 110h old -> swept.
         deleted = sweep_workdir(self.workdir, retention_hours=24, now=time.time() + 100 * 3600)
         self.assertEqual(deleted, 1)
         self.assertFalse(path.exists())
