@@ -1,0 +1,23 @@
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+
+# Local dev
+.env
+.env.local
+.venv/
+venv/
+
+# SPLAT build outputs (don't ship compiled artifacts; the Dockerfile rebuilds)
+*.o
+splat
+splat-hd
+
+# OS
+.DS_Store
+Thumbs.db
