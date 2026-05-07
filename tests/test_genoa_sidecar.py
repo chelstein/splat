@@ -8,10 +8,14 @@ production dependency).
 """
 from __future__ import annotations
 
+import os
+import tempfile
+import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from genoa_sidecar import _build_command, app, RunStats
+from genoa_sidecar import _build_command, app, RunStats, sweep_workdir
 
 
 class BuildCommandTests(unittest.TestCase):
@@ -20,7 +24,6 @@ class BuildCommandTests(unittest.TestCase):
 
     def test_minimal_payload_produces_t_flag(self):
         cmd = _build_command({"tx_qth": "site.qth"})
-        # cmd[0] is the SPLAT binary path; assert on the rest.
         self.assertEqual(cmd[1:], ["-t", "site.qth"])
 
     def test_full_payload(self):
@@ -89,7 +92,7 @@ class RunStatsTests(unittest.TestCase):
 
 
 class HealthAndVersionRoutesTests(unittest.TestCase):
-    """Pin the existing /healthz and /version contract so this PR can't drift it."""
+    """Pin the /healthz and /version contracts."""
 
     def setUp(self):
         self.client = app.test_client()
@@ -99,7 +102,8 @@ class HealthAndVersionRoutesTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.get_json(), {"status": "ok"})
 
-    def test_version_shape(self):
+    def test_version_includes_legacy_keys(self):
+        """Existing callers may key off these. Keep them."""
         resp = self.client.get("/version")
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
@@ -107,14 +111,18 @@ class HealthAndVersionRoutesTests(unittest.TestCase):
         self.assertIn("splat_bin", body)
         self.assertIn("workdir", body)
 
+    def test_version_includes_new_metadata(self):
+        resp = self.client.get("/version")
+        body = resp.get_json()
+        for key in ("git_commit_sha", "build_time", "splat_version"):
+            self.assertIn(key, body)
+
 
 class StatsRouteTests(unittest.TestCase):
     def setUp(self):
         self.client = app.test_client()
 
     def test_stats_route_returns_expected_keys(self):
-        # Don't assert exact values — the module-level _stats is shared
-        # state across tests in the same process. Shape is what we pin.
         resp = self.client.get("/api/v1/stats")
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
@@ -150,7 +158,6 @@ class SplatRunRouteTests(unittest.TestCase):
         resp = self.client.post("/api/v1/splat/run", json={"tx_qth": "x.qth"})
         self.assertEqual(resp.status_code, 200)
         body = resp.get_json()
-        # Existing fields callers depend on:
         self.assertEqual(body["returncode"], 0)
         self.assertEqual(body["stdout"], "ok")
         self.assertEqual(body["stderr"], "")
@@ -172,6 +179,62 @@ class SplatRunRouteTests(unittest.TestCase):
         self.client.post("/api/v1/splat/run", json={"tx_qth": "x.qth"})
         after = self.client.get("/api/v1/stats").get_json()["failure_count"]
         self.assertEqual(after, before + 1)
+
+
+class SweepWorkdirTests(unittest.TestCase):
+    """Pure-function tests for the workdir sweeper. No threads, no time.sleep."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.workdir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _touch(self, rel: str, age_seconds: float) -> Path:
+        path = self.workdir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x")
+        old = time.time() - age_seconds
+        os.utime(path, (old, old))
+        return path
+
+    def test_retention_zero_disables_sweep(self):
+        old = self._touch("a.ppm", age_seconds=10 * 3600)
+        self.assertEqual(sweep_workdir(self.workdir, retention_hours=0), 0)
+        self.assertTrue(old.exists())
+
+    def test_deletes_files_older_than_retention(self):
+        old = self._touch("old.ppm", age_seconds=48 * 3600)
+        fresh = self._touch("fresh.ppm", age_seconds=1 * 3600)
+        deleted = sweep_workdir(self.workdir, retention_hours=24)
+        self.assertEqual(deleted, 1)
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+
+    def test_skips_sample_data_tree(self):
+        """Reference fixtures shipped with the image are not run output."""
+        old_sample = self._touch("sample_data/wnju-dt.qth", age_seconds=10000 * 3600)
+        old_run = self._touch("out/coverage.ppm", age_seconds=10000 * 3600)
+        deleted = sweep_workdir(self.workdir, retention_hours=24)
+        self.assertEqual(deleted, 1)
+        self.assertTrue(old_sample.exists())
+        self.assertFalse(old_run.exists())
+
+    def test_recurses_into_subdirectories(self):
+        old_deep = self._touch("out/region/coverage.ppm", age_seconds=48 * 3600)
+        sweep_workdir(self.workdir, retention_hours=24)
+        self.assertFalse(old_deep.exists())
+
+    def test_now_argument_is_deterministic(self):
+        path = self._touch("x.ppm", age_seconds=10 * 3600)
+        # With now = current time, this 10h-old file is younger than 24h retention -> kept.
+        deleted = sweep_workdir(self.workdir, retention_hours=24, now=time.time())
+        self.assertEqual(deleted, 0)
+        # With now = current time + 100h, that same file looks 110h old -> swept.
+        deleted = sweep_workdir(self.workdir, retention_hours=24, now=time.time() + 100 * 3600)
+        self.assertEqual(deleted, 1)
+        self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":
