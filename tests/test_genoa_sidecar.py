@@ -9,6 +9,7 @@ production dependency).
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -50,8 +51,6 @@ class BuildCommandTests(unittest.TestCase):
         cmd = _build_command({"tx_qth": "x", "flags": [123]})
         self.assertEqual(cmd[-1], "123")
 
-    # ---- path confinement (validation gate) ----
-
     def test_tx_qth_traversal_rejected(self):
         err = _build_command({"tx_qth": "../etc/passwd"})
         self.assertIsInstance(err, str)
@@ -80,8 +79,6 @@ class BuildCommandTests(unittest.TestCase):
         })
         self.assertIsInstance(cmd, list)
 
-    # ---- flag traversal guard ----
-
     def test_flag_dotdot_rejected(self):
         err = _build_command({"tx_qth": "site.qth", "flags": ["-o", "../sneaky"]})
         self.assertIsInstance(err, str)
@@ -103,8 +100,6 @@ class BuildCommandTests(unittest.TestCase):
 
 
 class PathConfinementTests(unittest.TestCase):
-    """Direct tests on _path_inside_workdir helper."""
-
     def test_none_and_empty_pass(self):
         self.assertTrue(_path_inside_workdir(None))
         self.assertTrue(_path_inside_workdir(""))
@@ -192,8 +187,6 @@ class RunStatsTests(unittest.TestCase):
 
 
 class HealthAndVersionRoutesTests(unittest.TestCase):
-    """Pin /healthz and /version contracts."""
-
     def setUp(self):
         self.client = app.test_client()
 
@@ -216,11 +209,11 @@ class HealthAndVersionRoutesTests(unittest.TestCase):
         for key in ("git_commit_sha", "build_time", "splat_version", "auth_required"):
             self.assertIn(key, body)
 
-    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": ""}, clear=False)
     def test_version_auth_required_false_when_token_unset(self):
-        os.environ.pop("GENOA_API_TOKEN", None)
-        resp = self.client.get("/version")
-        self.assertFalse(resp.get_json()["auth_required"])
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GENOA_API_TOKEN", None)
+            resp = self.client.get("/version")
+            self.assertFalse(resp.get_json()["auth_required"])
 
     @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
     def test_version_auth_required_true_when_token_set(self):
@@ -229,7 +222,6 @@ class HealthAndVersionRoutesTests(unittest.TestCase):
 
     @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
     def test_healthz_unauthenticated_with_token_set(self):
-        """Health checks must work without a token even when auth is on."""
         resp = self.client.get("/healthz")
         self.assertEqual(resp.status_code, 200)
 
@@ -260,8 +252,6 @@ class StatsRouteTests(unittest.TestCase):
 
 
 class IsAuthorizedTests(unittest.TestCase):
-    """Direct tests on _is_authorized helper."""
-
     def _req(self, headers=None):
         class Req:
             pass
@@ -298,8 +288,6 @@ class IsAuthorizedTests(unittest.TestCase):
 
 
 class SplatRunRouteTests(unittest.TestCase):
-    """subprocess.run is patched so we don't need a real splat binary."""
-
     def setUp(self):
         self.client = app.test_client()
 
@@ -344,8 +332,6 @@ class SplatRunRouteTests(unittest.TestCase):
         after = self.client.get("/api/v1/stats").get_json()["failure_count"]
         self.assertEqual(after, before + 1)
 
-    # ---- auth gating on the run endpoint ----
-
     @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
     def test_run_without_auth_header_returns_401(self):
         resp = self.client.post("/api/v1/splat/run", json={"tx_qth": "x.qth"})
@@ -371,8 +357,6 @@ class SplatRunRouteTests(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 200)
 
-    # ---- path confinement at the route level ----
-
     def test_run_with_traversal_in_tx_qth_returns_400(self):
         resp = self.client.post(
             "/api/v1/splat/run",
@@ -396,6 +380,133 @@ class SplatRunRouteTests(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 400)
         self.assertIn("path traversal", resp.get_json()["error"])
+
+
+class ArtifactsRouteTests(unittest.TestCase):
+    """Artifact list + fetch routes.
+
+    Each test gets a unique sub-directory under WORKDIR so file seeds
+    don't collide across tests, and the directory is removed in tearDown.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from genoa_sidecar import WORKDIR
+        cls.WORKDIR = WORKDIR
+
+    def setUp(self):
+        self.client = app.test_client()
+        self.test_dir = self.WORKDIR / f"test_artifacts_{os.getpid()}_{time.time_ns()}"
+        self.test_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _seed(self, rel: str, content: bytes = b"x") -> Path:
+        p = self.test_dir / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(content)
+        return p
+
+    def _rel(self, p: Path) -> str:
+        return p.relative_to(self.WORKDIR).as_posix()
+
+    # ---- list ----
+
+    def test_list_returns_expected_top_level_keys(self):
+        resp = self.client.get("/api/v1/artifacts")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        for key in ("workdir", "count", "artifacts"):
+            self.assertIn(key, body)
+        self.assertIsInstance(body["artifacts"], list)
+        self.assertEqual(body["count"], len(body["artifacts"]))
+
+    def test_list_returns_seeded_files(self):
+        a = self._seed("a.ppm", b"PPM A")
+        b = self._seed("nested/b.kml", b"<kml/>")
+        body = self.client.get("/api/v1/artifacts").get_json()
+        paths = {item["path"] for item in body["artifacts"]}
+        self.assertIn(self._rel(a), paths)
+        self.assertIn(self._rel(b), paths)
+
+    def test_list_item_has_expected_per_artifact_keys(self):
+        seeded = self._seed("item.ppm", b"abcde")
+        body = self.client.get("/api/v1/artifacts").get_json()
+        rel = self._rel(seeded)
+        item = next((i for i in body["artifacts"] if i["path"] == rel), None)
+        self.assertIsNotNone(item, f"seeded file {rel} not in listing")
+        self.assertEqual(item["size_bytes"], 5)
+        self.assertEqual(item["url"], f"/api/v1/artifacts/{rel}")
+        self.assertIn("modified_at", item)
+
+    def test_list_sorts_newest_first(self):
+        old = self._seed("old.ppm", b"old")
+        os.utime(old, (time.time() - 3600, time.time() - 3600))
+        new = self._seed("new.ppm", b"new")
+        items = self.client.get("/api/v1/artifacts").get_json()["artifacts"]
+        rel_old = self._rel(old)
+        rel_new = self._rel(new)
+        positions = {item["path"]: idx for idx, item in enumerate(items)}
+        self.assertIn(rel_old, positions)
+        self.assertIn(rel_new, positions)
+        self.assertLess(positions[rel_new], positions[rel_old])
+
+    # ---- get ----
+
+    def test_get_returns_file_content(self):
+        seeded = self._seed("file.txt", b"hello world")
+        resp = self.client.get(f"/api/v1/artifacts/{self._rel(seeded)}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, b"hello world")
+
+    def test_get_missing_returns_404(self):
+        resp = self.client.get("/api/v1/artifacts/this/does/not/exist.foo")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_get_traversal_blocked(self):
+        # Encoded traversal in the URL path.  Either 400 (caught by
+        # _path_inside_workdir) or 404 (caught by send_from_directory)
+        # is acceptable — both refuse the escape.
+        resp = self.client.get("/api/v1/artifacts/..%2Fetc%2Fpasswd")
+        self.assertIn(resp.status_code, (400, 404))
+
+    def test_get_nested_path(self):
+        seeded = self._seed("deep/nested/coverage.ppm", b"deep")
+        resp = self.client.get(f"/api/v1/artifacts/{self._rel(seeded)}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, b"deep")
+
+    # ---- auth ----
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
+    def test_list_requires_auth_when_token_set(self):
+        resp = self.client.get("/api/v1/artifacts")
+        self.assertEqual(resp.status_code, 401)
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
+    def test_list_with_correct_token(self):
+        resp = self.client.get(
+            "/api/v1/artifacts",
+            headers={"Authorization": "Bearer sekret"},
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
+    def test_get_requires_auth_when_token_set(self):
+        seeded = self._seed("auth_test.txt", b"data")
+        resp = self.client.get(f"/api/v1/artifacts/{self._rel(seeded)}")
+        self.assertEqual(resp.status_code, 401)
+
+    @mock.patch.dict(os.environ, {"GENOA_API_TOKEN": "sekret"})
+    def test_get_with_correct_token(self):
+        seeded = self._seed("auth_pass.txt", b"data")
+        resp = self.client.get(
+            f"/api/v1/artifacts/{self._rel(seeded)}",
+            headers={"Authorization": "Bearer sekret"},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, b"data")
 
 
 class SweepWorkdirTests(unittest.TestCase):

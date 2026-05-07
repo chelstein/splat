@@ -4,23 +4,25 @@
 Flask + gunicorn version (so the DigitalOcean App Platform CMD
 `gunicorn genoa_sidecar:app` can bind directly).  Routes:
 
-  GET  /healthz              -> {"status": "ok"}                 (always open)
-  GET  /version              -> sidecar metadata + git SHA + SPLAT version  (always open)
-  GET  /api/v1/stats         -> per-worker run counters           (always open)
-  POST /api/v1/splat/run     -> runs ./splat with the given args  (auth-gated when GENOA_API_TOKEN is set)
+  GET  /healthz                       -> {"status": "ok"}                 (always open)
+  GET  /version                       -> sidecar metadata + git SHA + SPLAT version  (always open)
+  GET  /api/v1/stats                  -> per-worker run counters           (always open)
+  POST /api/v1/splat/run              -> runs ./splat with the given args  (auth-gated when GENOA_API_TOKEN is set)
+  GET  /api/v1/artifacts              -> list files in WORKDIR              (auth-gated when GENOA_API_TOKEN is set)
+  GET  /api/v1/artifacts/<path>       -> fetch a file from WORKDIR         (auth-gated when GENOA_API_TOKEN is set)
 
-Auth: opt-in.  If GENOA_API_TOKEN is unset, the run endpoint is open
-(backward compatible).  If set, callers must send
+Auth: opt-in.  If GENOA_API_TOKEN is unset, the run/artifact endpoints
+are open (backward compatible).  If set, callers must send
   Authorization: Bearer <token>
-or receive 401.  Read endpoints (/healthz, /version, /api/v1/stats)
-remain unauthenticated so platform health checks and dashboards work
-without a token.
+or receive 401.  Read-only health endpoints (/healthz, /version,
+/api/v1/stats) remain unauthenticated so platform health checks and
+dashboards work without a token.
 
 Path confinement: regardless of auth, every path-like field on the run
-payload (`tx_qth`, `rx_qth`, `output_base`) must resolve INSIDE WORKDIR
-after Path.resolve(); otherwise the request is rejected 400.  This
-means that even an authenticated caller cannot direct SPLAT to read or
-write arbitrary filesystem paths via these fields.
+payload (`tx_qth`, `rx_qth`, `output_base`) and the artifact path must
+resolve INSIDE WORKDIR after Path.resolve(); otherwise the request is
+rejected 400/404.  Even an authenticated caller cannot direct SPLAT to
+read or write arbitrary filesystem paths via these fields.
 
 The SPLAT binary is invoked via subprocess against `WORKDIR`.  The
 container is expected to have already built `./splat` (Dockerfile runs
@@ -45,7 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Union
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 
 log = logging.getLogger("genoa-sidecar")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
@@ -65,12 +67,7 @@ app = Flask("genoa-sidecar")
 
 
 def _detect_splat_version() -> str:
-    """Try to extract the SPLAT version banner.
-
-    SPLAT prints its version on the first line of `splat -h`. If the
-    binary is missing, unrunnable, or formatted unexpectedly, return
-    "unknown" — the sidecar must still come up cleanly.
-    """
+    """Try to extract the SPLAT version banner.  Returns 'unknown' on failure."""
     try:
         result = subprocess.run(
             [SPLAT_BIN, "-h"],
@@ -94,13 +91,7 @@ SPLAT_VERSION = _detect_splat_version()
 
 
 class RunStats:
-    """In-memory aggregator for /api/v1/splat/run invocations.
-
-    Counts are PER-WORKER. Gunicorn pre-forks (default 2 workers in this
-    deployment), so /api/v1/stats reflects whichever worker handled that
-    GET, not a global view across the fleet. If a global view becomes
-    important, swap this for Redis or Postgres-backed counters.
-    """
+    """In-memory aggregator for /api/v1/splat/run invocations (per worker)."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -148,8 +139,7 @@ def _configured_token() -> Optional[str]:
     """Return the configured bearer token, or None if auth is disabled.
 
     Read at request time so operators can rotate the token without
-    restarting the container (set the env var, redeploy is not required
-    when only this value changes).
+    restarting the container.
     """
     tok = (os.getenv("GENOA_API_TOKEN") or "").strip()
     return tok or None
@@ -165,20 +155,13 @@ def _is_authorized(req) -> bool:
     if not header.startswith(prefix):
         return False
     presented = header[len(prefix):].strip()
-    # Constant-time comparison to avoid timing oracles.
     return secrets.compare_digest(presented.encode("utf-8"), token.encode("utf-8"))
 
 
 # ---------- Path confinement ----------
 
 def _path_inside_workdir(value: Optional[str]) -> bool:
-    """True if `value` is empty / None, or resolves inside WORKDIR.
-
-    Empty strings and None are treated as "not provided" and are
-    trivially OK — the caller decides whether the field is required.
-    Any other value is resolved RELATIVE TO WORKDIR (matches the
-    subprocess cwd), then checked.
-    """
+    """True if `value` is empty / None, or resolves inside WORKDIR."""
     if not value:
         return True
     try:
@@ -190,14 +173,7 @@ def _path_inside_workdir(value: Optional[str]) -> bool:
 
 
 def _flag_has_traversal(flag: object) -> bool:
-    """True if a `flags[]` entry tries to sneak a traversal past path checks.
-
-    Conservative: rejects anything containing '..' as a substring or any
-    component that begins with '/'.  This blocks the obvious dotdot
-    escape and absolute-path injection through SPLAT options like
-    `-o /etc/passwd` while still allowing benign flags such as `-metric`,
-    `-dbm`, or relative output bases passed via `flags`.
-    """
+    """True if a `flags[]` entry tries to sneak a traversal past path checks."""
     s = str(flag)
     if ".." in s:
         return True
@@ -207,14 +183,7 @@ def _flag_has_traversal(flag: object) -> bool:
 
 
 def sweep_workdir(workdir: Path, retention_hours: float, *, now: Optional[float] = None) -> int:
-    """Delete files in `workdir` whose mtime is older than retention_hours.
-
-    Returns the number of files deleted. Subdirectories are recursed but
-    not themselves deleted. The sample_data/ tree (shipped with the
-    image) is left alone.
-
-    Pass `now` (epoch seconds) to make this deterministic in tests.
-    """
+    """Delete files in `workdir` whose mtime is older than retention_hours."""
     if retention_hours <= 0:
         return 0
     cutoff = (now if now is not None else time.time()) - retention_hours * 3600.0
@@ -278,8 +247,6 @@ def version():
         "splat_bin":      SPLAT_BIN,
         "splat_version":  SPLAT_VERSION,
         "workdir":        str(WORKDIR),
-        # Surface auth state so operators can verify a deploy without
-        # leaking the token itself.
         "auth_required":  _configured_token() is not None,
     })
 
@@ -338,6 +305,72 @@ def splat_run():
     )
 
 
+@app.get("/api/v1/artifacts")
+def artifacts_list():
+    """List files in WORKDIR (excluding sample_data/), newest first.
+
+    Each entry has { path, size_bytes, modified_at, url }.  The url is
+    a relative path that the caller can append to the sidecar's base
+    URL to fetch the file via /api/v1/artifacts/<path>.
+
+    Auth-gated when GENOA_API_TOKEN is set.  Stat'ing every file in a
+    huge WORKDIR can be slow; the sweeper bounds disk usage so this
+    endpoint stays responsive in practice.
+    """
+    if not _is_authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    items = []
+    for path in WORKDIR.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            rel = path.relative_to(WORKDIR)
+        except ValueError:
+            continue
+        # Skip sample_data fixtures — same convention as the sweeper.
+        # Operators can still GET them by path if needed.
+        if rel.parts and rel.parts[0] == "sample_data":
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        rel_posix = rel.as_posix()
+        items.append({
+            "path":        rel_posix,
+            "size_bytes":  stat.st_size,
+            "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(timespec="seconds"),
+            "url":         f"/api/v1/artifacts/{rel_posix}",
+        })
+    items.sort(key=lambda r: r["modified_at"], reverse=True)
+    return jsonify({
+        "workdir":   str(WORKDIR),
+        "count":     len(items),
+        "artifacts": items,
+    })
+
+
+@app.get("/api/v1/artifacts/<path:filename>")
+def artifacts_get(filename):
+    """Fetch a file from WORKDIR.
+
+    Path-confined: the requested filename must resolve inside WORKDIR.
+    Otherwise 400.  Missing files return 404.  Auth-gated when
+    GENOA_API_TOKEN is set.
+    """
+    if not _is_authorized(request):
+        return jsonify({"error": "unauthorized"}), 401
+    if not _path_inside_workdir(filename):
+        return jsonify({"error": "path resolves outside WORKDIR"}), 400
+    target = (WORKDIR / filename).resolve()
+    if not target.is_file():
+        return jsonify({"error": "not found"}), 404
+    # send_from_directory does its own path containment check on top
+    # of ours; both belt and suspenders here is intentional.
+    return send_from_directory(str(WORKDIR), filename, as_attachment=False)
+
+
 def _build_command(payload: dict) -> Union[list, str]:
     """Validate the payload and assemble the SPLAT argv.
 
@@ -348,14 +381,11 @@ def _build_command(payload: dict) -> Union[list, str]:
     if not tx_qth:
         return "tx_qth is required"
 
-    # Path confinement.  All path-like fields must resolve inside WORKDIR.
     for field in ("tx_qth", "rx_qth", "output_base"):
         value = payload.get(field)
         if not _path_inside_workdir(value):
             return f"{field} resolves outside WORKDIR"
 
-    # Flag traversal guard.  Refuse `..` substrings and absolute paths
-    # in flag values to block the obvious sneak-past-path-confinement.
     for flag in payload.get("flags", []):
         if _flag_has_traversal(flag):
             return f"flags entry {flag!r} contains path traversal or absolute path"
@@ -376,7 +406,6 @@ def _build_command(payload: dict) -> Union[list, str]:
     return command
 
 
-# Start the sweeper when imported under gunicorn (and when run directly).
 _start_sweeper()
 
 
