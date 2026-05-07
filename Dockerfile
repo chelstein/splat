@@ -6,9 +6,14 @@
 # app under gunicorn so DO can bind to ${PORT:-8080} cleanly.
 #
 # Build args:
-#   GIT_COMMIT_SHA — stamped via gunicorn env (optional; for audit).
+#   GIT_COMMIT_SHA — stamped into /version (audit trail). Optional;
+#                    defaults to "unknown".
+#   BUILD_TIME     — stamped into /version. Optional.
 
 FROM python:3.12-slim
+
+ARG GIT_COMMIT_SHA=unknown
+ARG BUILD_TIME=unknown
 
 WORKDIR /app
 
@@ -28,7 +33,9 @@ RUN chmod +x configure build install clean || true
 ENV GENOA_HOST=0.0.0.0 \
     GENOA_PORT=8080 \
     SPLAT_BIN=/app/splat \
-    SPLAT_WORKDIR=/app/work
+    SPLAT_WORKDIR=/app/work \
+    GIT_COMMIT_SHA=${GIT_COMMIT_SHA} \
+    BUILD_TIME=${BUILD_TIME}
 
 EXPOSE 8080
 
