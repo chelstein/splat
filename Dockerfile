@@ -9,18 +9,29 @@
 #   GIT_COMMIT_SHA — stamped into /version (audit trail). Optional;
 #                    defaults to "unknown".
 #   BUILD_TIME     — stamped into /version. Optional.
+#   SPLAT_MAXPAGES — page count baked into splat.h before compile.
+#                    Default 9 = 3x3 deg analysis region (~52 MB RAM
+#                    budget).  See ./configure for the full table.
 
 FROM python:3.12-slim
 
 ARG GIT_COMMIT_SHA=unknown
 ARG BUILD_TIME=unknown
+ARG SPLAT_MAXPAGES=9
 
 WORKDIR /app
 
+# build-essential / g++ / make for ./build all; libbz2-dev is required
+# for splat (-lbz2) and srtm2sdf (-lbz2); zlib1g-dev is required for
+# fontdata (-lz).  Without these the prior image silently shipped no
+# splat binary at all and /api/v1/splat/run leaked an HTTP 500 from
+# subprocess FileNotFoundError.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     g++ \
     make \
+    libbz2-dev \
+    zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
@@ -28,12 +39,23 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
 
-RUN chmod +x configure build install clean || true
+RUN chmod +x configure build install clean utils/build utils/install || true
+
+# Bake std-parms.h non-interactively so ./build can pick it up without
+# running the menu-driven configure script.  Skip the optional HD build
+# (no hd-parms.h) since the sidecar runs in 3 arc-second mode.
+RUN printf '/* Generated non-interactively in Dockerfile. */\n#define HD_MODE 0\n#define MAXPAGES %s\n' "$SPLAT_MAXPAGES" > std-parms.h \
+    && rm -f hd-parms.h \
+    && ./build all \
+    && test -x /app/splat \
+    && test -x /app/utils/srtm2sdf \
+    && test -x /app/utils/usgs2sdf
 
 ENV GENOA_HOST=0.0.0.0 \
     GENOA_PORT=8080 \
     SPLAT_BIN=/app/splat \
     SPLAT_WORKDIR=/app/work \
+    SPLAT_UTILS_DIR=/app/utils \
     GIT_COMMIT_SHA=${GIT_COMMIT_SHA} \
     BUILD_TIME=${BUILD_TIME}
 
