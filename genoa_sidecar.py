@@ -297,6 +297,13 @@ def version():
         "workdir":        str(WORKDIR),
         "sdf_dir":        SDF_DIR_NAME,
         "auth_required":  _configured_token() is not None,
+        # DO App Platform auto-injects APP_DEPLOYMENT_ID and APP_DOMAIN at
+        # runtime.  These give an unambiguous "what's actually running" signal
+        # without the manual upkeep that GIT_COMMIT_SHA + BUILD_TIME require
+        # (those are baked at build time and have to be re-stamped on each
+        # apps-update).  Empty string when running outside App Platform.
+        "deployment_id":  os.getenv("APP_DEPLOYMENT_ID", ""),
+        "app_domain":     os.getenv("APP_DOMAIN", ""),
     })
 
 
