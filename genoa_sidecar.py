@@ -9,6 +9,7 @@ Flask + gunicorn version (so the DigitalOcean App Platform CMD
   GET    /api/v1/stats                  -> per-worker run counters           (always open)
   POST   /api/v1/splat/run              -> runs ./splat with the given args  (auth-gated when GENOA_API_TOKEN is set)
   POST   /api/v1/splat/run-inline       -> JSON-in coverage sweep (no on-disk QTH) (auth-gated)
+  POST   /api/v1/sdf/convert/srtm/<n>   -> run srtm2sdf on uploaded .hgt and stage the .sdf (auth-gated)
   GET    /api/v1/artifacts              -> list files in WORKDIR              (auth-gated)
   GET    /api/v1/artifacts/<path>       -> fetch a file from WORKDIR         (auth-gated)
   GET    /api/v1/sdf                    -> list SPLAT terrain (.sdf/.sdz) tiles  (auth-gated)
@@ -88,10 +89,15 @@ app.config["MAX_CONTENT_LENGTH"] = SDF_MAX_UPLOAD_BYTES
 
 
 def _detect_splat_version() -> str:
-    """Try to extract the SPLAT version banner.  Returns 'unknown' on failure."""
+    """Try to extract the SPLAT version banner.  Returns 'unknown' on failure.
+
+    SPLAT prints its banner only when invoked with NO arguments
+    (argc==1 in splat.cpp); the `-h` flag is misinterpreted as
+    "terrain-height graph filename" and errors out.  The banner
+    format is `--==[ SPLAT! v1.4.2 Available Options... ]==--`."""
     try:
         result = subprocess.run(
-            [SPLAT_BIN, "-h"],
+            [SPLAT_BIN],
             cwd=str(WORKDIR),
             capture_output=True,
             text=True,
@@ -101,10 +107,9 @@ def _detect_splat_version() -> str:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return "unknown"
     blob = (result.stdout or "") + "\n" + (result.stderr or "")
-    for line in blob.splitlines():
-        line = line.strip()
-        if line.lower().startswith("splat") and any(c.isdigit() for c in line):
-            return line
+    m = re.search(r"SPLAT!?\s*(?:HD\s+)?v\s*([0-9][0-9A-Za-z.\-]*)", blob)
+    if m:
+        return f"SPLAT! v{m.group(1)}"
     return "unknown"
 
 
@@ -224,7 +229,7 @@ def sweep_workdir(workdir: Path, retention_hours: float, *, now: Optional[float]
     """Delete files in `workdir` whose mtime is older than retention_hours.
 
     Files under the SWEEPER_EXEMPT_DIRS (sample_data/, sdf/) are
-    preserved regardless of mtime — they're long-lived terrain data
+    preserved regardless of mtime - they're long-lived terrain data
     and image fixtures, not run output.
     """
     if retention_hours <= 0:
@@ -557,6 +562,24 @@ inline_runner.attach(
     is_authorized=_is_authorized,
 )
 app.register_blueprint(inline_runner.bp)
+
+
+# Register the SRTM -> SDF converter endpoint.  Same pattern as the
+# inline runner: separate module, attach() with shared lifecycle
+# state, register_blueprint().  SPLAT_UTILS_DIR comes from the
+# Dockerfile and points at /app/utils where ./build all puts the
+# srtm2sdf / usgs2sdf binaries.
+import sdf_converter  # noqa: E402
+
+SPLAT_UTILS_DIR = Path(os.getenv("SPLAT_UTILS_DIR", "/app/utils")).resolve()
+
+sdf_converter.attach(
+    workdir=WORKDIR,
+    sdf_dir=SDF_DIR,
+    utils_dir=SPLAT_UTILS_DIR,
+    is_authorized=_is_authorized,
+)
+app.register_blueprint(sdf_converter.bp)
 
 
 _start_sweeper()
