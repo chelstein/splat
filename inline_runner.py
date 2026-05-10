@@ -361,6 +361,15 @@ def run_inline():
                     "rx_lon": round(rx_lon_e, 6),
                 })
                 continue
+            except FileNotFoundError:
+                # splat binary missing in the image.  Bail the whole
+                # sweep — every radial would hit the same wall.
+                return jsonify({
+                    "available": False,
+                    "source":    "splat-sidecar",
+                    "error":     f"splat binary not found at {splat_bin}",
+                    "hint":      "image was built without ./build all; rebuild with the current Dockerfile",
+                }), 500
 
             if len(stdout_chunks) < 6:
                 stdout_chunks.append(
