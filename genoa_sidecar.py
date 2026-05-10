@@ -10,7 +10,8 @@ Flask + gunicorn version (so the DigitalOcean App Platform CMD
   POST   /api/v1/splat/run              -> runs ./splat with the given args  (auth-gated when GENOA_API_TOKEN is set)
   POST   /api/v1/splat/run-inline       -> JSON-in coverage sweep (no on-disk QTH) (auth-gated)
   POST   /api/v1/sdf/convert/srtm/<n>   -> run srtm2sdf on uploaded .hgt and stage the .sdf (auth-gated)
-  POST   /api/v1/itm/p2p                -> point_to_point_ITM thunk for splat-vs-JS bake-off (auth-gated)
+  POST   /api/v1/itm/p2p                -> point_to_point_ITM thunk (NTIA v1.2.2) for bake-off (auth-gated)
+  POST   /api/v1/itm/p2p_itwom          -> point_to_point thunk (ITWOM 3.0) for bake-off (auth-gated)
   GET    /api/v1/artifacts              -> list files in WORKDIR              (auth-gated)
   GET    /api/v1/artifacts/<path>       -> fetch a file from WORKDIR         (auth-gated)
   GET    /api/v1/sdf                    -> list SPLAT terrain (.sdf/.sdz) tiles  (auth-gated)
@@ -590,21 +591,31 @@ sdf_converter.attach(
 app.register_blueprint(sdf_converter.bp)
 
 
-# Register the point-to-point ITM thunk endpoint (/api/v1/itm/p2p).
-# Bake-off reference for chelstein/itmlogic's JS port: takes the same
-# inputs the JS pointToPoint() consumes (profile + p2p params) and
-# returns the dbloss / strmode / errnum that the C++ point_to_point_ITM
-# emits.  Backed by the test_p2p binary compiled by the Dockerfile
-# from test_p2p.cpp.
+# Register the point-to-point ITM thunk endpoints:
+#   /api/v1/itm/p2p        -> point_to_point_ITM   (NTIA v1.2.2)
+#   /api/v1/itm/p2p_itwom  -> point_to_point       (ITWOM 3.0 canopy-aware)
+#
+# Both are bake-off references for chelstein/itmlogic's JS port: they
+# take the same inputs the JS pointToPoint() / pointToPointItwom()
+# consume and return the dbloss / strmode / errnum that the matching
+# C++ entry emits.  Backed by /app/test_p2p and /app/test_p2p_itwom
+# binaries compiled by the Dockerfile.
 import itm_p2p  # noqa: E402
 
-SPLAT_TEST_P2P_BIN = Path(os.getenv("SPLAT_TEST_P2P_BIN", "/app/test_p2p")).resolve()
+SPLAT_TEST_P2P_BIN       = Path(os.getenv("SPLAT_TEST_P2P_BIN",       "/app/test_p2p")).resolve()
+SPLAT_TEST_P2P_ITWOM_BIN = Path(os.getenv("SPLAT_TEST_P2P_ITWOM_BIN", "/app/test_p2p_itwom")).resolve()
 
 itm_p2p.attach(
     test_p2p_bin=SPLAT_TEST_P2P_BIN,
     is_authorized=_is_authorized,
 )
 app.register_blueprint(itm_p2p.bp)
+app.register_blueprint(itm_p2p.make_blueprint(
+    name="itm_p2p_itwom",
+    route_path="/api/v1/itm/p2p_itwom",
+    binary_path=SPLAT_TEST_P2P_ITWOM_BIN,
+    is_authorized=_is_authorized,
+))
 
 
 _start_sweeper()
