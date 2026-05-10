@@ -1,0 +1,4 @@
+# REMOVED — replaced by per-role docker-compose files:
+#
+#   radiodns/dns/master/docker-compose.yml    — hidden master + PostgreSQL
+#   radiodns/dns/secondary/docker-compose.yml — public secondary (ns1-ns11)

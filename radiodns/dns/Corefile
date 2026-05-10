@@ -1,0 +1,7 @@
+# REMOVED — CoreDNS replaced by PowerDNS Authoritative.
+#
+# See:
+#   radiodns/dns/master/   — hidden master config + docker-compose
+#   radiodns/dns/secondary/ — public ns1-ns11 config + docker-compose
+#   radiodns/dns/scripts/   — provision-zone.sh, setup-tsig.sh, enable-dnssec.sh
+#   radiodns/docs/architecture.md

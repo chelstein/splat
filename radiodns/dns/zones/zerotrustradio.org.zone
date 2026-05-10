@@ -1,0 +1,8 @@
+# REMOVED — static zone files are not used with PowerDNS Authoritative.
+#
+# Zone data lives in the PostgreSQL database on the hidden master and is
+# provisioned via the PowerDNS HTTP API:
+#
+#   radiodns/dns/scripts/provision-zone.sh
+#
+# Secondaries (ns1-ns11) receive zone data via TSIG-authenticated AXFR/IXFR.

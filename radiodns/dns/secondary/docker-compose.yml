@@ -1,0 +1,27 @@
+# Public secondary stack: PowerDNS Authoritative (lmdb backend)
+# Deploy on each ns1-ns11 host.
+# No secrets required — TSIG key is imported via add-secondary.sh
+# and stored in the lmdb backend.
+#
+# Exposes: 53/udp, 53/tcp only.
+# Port 8081 is not mapped (API disabled in pdns.conf).
+
+services:
+  pdns-secondary:
+    image: powerdns/pdns-auth-49:latest
+    restart: unless-stopped
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    volumes:
+      - ./pdns.conf:/etc/powerdns/pdns.conf:ro
+      - lmdb_data:/var/lib/powerdns
+    healthcheck:
+      test: ["CMD", "pdns_control", "rping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  lmdb_data:
