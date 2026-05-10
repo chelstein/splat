@@ -9,10 +9,11 @@ run srtm2sdf for it.
 
 Flow per request:
   1. Validate the input name matches the SRTM-3 / SRTM-1 convention
-     (NLLLELLL.hgt or .bil) so srtm2sdf's filename-driven coord
-     parser doesn't choke.
+     (NLLLELLL.hgt or .bil, optionally .zip-wrapped) so srtm2sdf's
+     filename-driven coord parser doesn't choke.
   2. Materialise an ephemeral run dir under WORKDIR/convert-<uuid>/.
-  3. Write the body bytes to <run_dir>/<input_name>.
+  3. Write the body bytes to <run_dir>/<input_name>.  If .zip,
+     extract the inner .hgt / .bil and switch the working filename.
   4. Run /app/utils/srtm2sdf <input_name> with cwd=<run_dir>.  It
      writes the resulting <lat_lo>:<lat_hi>:<lon_lo>:<lon_hi>.sdf
      into the run dir.
@@ -58,10 +59,13 @@ def attach(*, workdir: Path, sdf_dir: Path, utils_dir: Path,
 
 
 # Accepts both 3-arc-sec (NLLLELLL.hgt) and the .bil variant for the
-# USGS Seamless server output.  Filename pattern is enforced because
-# srtm2sdf parses the coords directly out of it; a sloppy name here
-# yields nonsense .sdf tile names.
-_SRTM_NAME_RE = re.compile(r"^[NSns][0-9]{2}[EWew][0-9]{3}\.(hgt|bil)$")
+# USGS Seamless server output.  Also accepts the .zip-wrapped variant
+# served by most public SRTM mirrors (ESA STEP, USGS, NASA EarthData)
+# so the JS provisioner can pass straight-from-mirror bytes through.
+# Filename pattern is enforced because srtm2sdf parses the coords
+# directly out of it; a sloppy name here yields nonsense .sdf tile
+# names.
+_SRTM_NAME_RE = re.compile(r"^[NSns][0-9]{2}[EWew][0-9]{3}\.(hgt|bil)(\.zip)?$")
 
 # SDF filenames as written by srtm2sdf are
 # <lat_lo>:<lat_hi>:<lon_lo>:<lon_hi>.sdf - strip anything that doesn't
@@ -76,7 +80,7 @@ def _validate_input_name(name: Optional[str]) -> Optional[str]:
         return "input_name must not contain path separators or '..'"
     if not _SRTM_NAME_RE.match(name):
         return ("input_name must match SRTM convention "
-                "(e.g. N40W074.hgt or S22E018.bil)")
+                "(e.g. N40W074.hgt, N40W074.hgt.zip or S22E018.bil)")
     return None
 
 
@@ -133,6 +137,30 @@ def convert_srtm(input_name: str):
     try:
         input_path = run_dir / input_name
         input_path.write_bytes(body_bytes)
+
+        # If the caller posted a .hgt.zip / .bil.zip (the format most
+        # public SRTM mirrors serve), unzip in place and switch the
+        # input_name to the unzipped file for srtm2sdf.  Single-file
+        # zips only - error 422 if the archive contains anything else.
+        if input_name.endswith(".zip"):
+            import zipfile
+            try:
+                with zipfile.ZipFile(input_path) as zf:
+                    members = [m for m in zf.namelist() if not m.endswith("/")]
+                    if not members:
+                        return jsonify({"error": "zip archive is empty"}), 422
+                    inner = members[0]
+                    inner_safe = Path(inner).name  # strip any path component
+                    if not re.match(r"^[NSns][0-9]{2}[EWew][0-9]{3}\.(hgt|bil)$", inner_safe):
+                        return jsonify({
+                            "error": f"zip member {inner_safe!r} is not a valid SRTM tile",
+                        }), 422
+                    target = run_dir / inner_safe
+                    with zf.open(inner) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+            except zipfile.BadZipFile:
+                return jsonify({"error": "input is not a valid zip archive"}), 422
+            input_name = inner_safe   # srtm2sdf runs against the unzipped file
 
         # srtm2sdf expects the input file as a positional arg; -d /dev/null
         # disables the optional usgs2sdf-replacement step (which would
