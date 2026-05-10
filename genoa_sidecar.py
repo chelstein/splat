@@ -330,6 +330,13 @@ def splat_run():
         elapsed = time.monotonic() - started
         _stats.record(returncode=-1, runtime_seconds=elapsed, command_string=command_string)
         return jsonify({"error": "splat run timed out"}), 408
+    except FileNotFoundError:
+        elapsed = time.monotonic() - started
+        _stats.record(returncode=-1, runtime_seconds=elapsed, command_string=command_string)
+        return jsonify({
+            "error": f"splat binary not found at {SPLAT_BIN}",
+            "hint":  "image was built without ./build all; rebuild with the current Dockerfile",
+        }), 500
 
     elapsed = time.monotonic() - started
     _stats.record(
