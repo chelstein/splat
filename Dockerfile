@@ -51,15 +51,19 @@ RUN printf '/* Generated non-interactively in Dockerfile. */\n#define HD_MODE 0\
     && test -x /app/utils/srtm2sdf \
     && test -x /app/utils/usgs2sdf
 
-# test_p2p: minimal CLI thunk into point_to_point_ITM, the same
-# function splat invokes for site-report site-to-site path loss.
-# Used by the splat-vs-JS bake-off harness in chelstein/itmlogic.
-# Compile flags mirror ./build's splat target; we only link the
-# itwom3.0.cpp translation unit (point_to_point_ITM is defined there)
-# so we don't pull in splat.cpp's main() and 200KB of other code.
+# test_p2p: CLI thunk into point_to_point_ITM (NTIA v1.2.2 baseline).
+# test_p2p_itwom: CLI thunk into point_to_point (ITWOM 3.0 canopy-
+# aware extensions).  Both used by chelstein/itmlogic's splat-vs-JS
+# bake-off harness.  Compile flags mirror ./build's splat target; we
+# only link the itwom3.0.cpp translation unit (both p2p entries are
+# defined there) so we don't pull in splat.cpp's main() and ~200 KB
+# of other code.
 RUN g++ -O2 -s -fomit-frame-pointer -ffast-math -pipe \
         itwom3.0.cpp test_p2p.cpp -lm -lbz2 -o test_p2p \
-    && test -x /app/test_p2p
+    && test -x /app/test_p2p \
+    && g++ -O2 -s -fomit-frame-pointer -ffast-math -pipe \
+        itwom3.0.cpp test_p2p_itwom.cpp -lm -lbz2 -o test_p2p_itwom \
+    && test -x /app/test_p2p_itwom
 
 ENV GENOA_HOST=0.0.0.0 \
     GENOA_PORT=8080 \
@@ -67,6 +71,7 @@ ENV GENOA_HOST=0.0.0.0 \
     SPLAT_WORKDIR=/app/work \
     SPLAT_UTILS_DIR=/app/utils \
     SPLAT_TEST_P2P_BIN=/app/test_p2p \
+    SPLAT_TEST_P2P_ITWOM_BIN=/app/test_p2p_itwom \
     GIT_COMMIT_SHA=${GIT_COMMIT_SHA} \
     BUILD_TIME=${BUILD_TIME}
 
