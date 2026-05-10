@@ -1,0 +1,51 @@
+# Hidden master stack: PowerDNS Authoritative + PostgreSQL
+# Deploy on a private/admin host — NOT a public NS node.
+#
+# Required env vars (supply via .env file or Docker secrets):
+#   PDNS_DB_PASSWORD  — PostgreSQL password for the pdns user
+#   PDNS_API_KEY      — PowerDNS HTTP API key (admin access)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pdns
+      POSTGRES_USER: pdns
+      POSTGRES_PASSWORD: ${PDNS_DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../schema/pdns-gpgsql.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "pdns", "-d", "pdns"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  pdns-master:
+    image: powerdns/pdns-auth-49:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "127.0.0.1:8081:8081"  # API on loopback; ufw blocks 8081 externally
+    environment:
+      PDNS_DB_PASSWORD: ${PDNS_DB_PASSWORD}
+      PDNS_API_KEY: ${PDNS_API_KEY}
+    volumes:
+      - ./pdns.conf:/etc/powerdns/pdns.conf.tpl:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/entrypoint.sh"]
+    healthcheck:
+      test: ["CMD", "pdns_control", "rping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  pgdata:

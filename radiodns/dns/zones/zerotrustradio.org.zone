@@ -1,55 +1,8 @@
-$ORIGIN zerotrustradio.org.
-$TTL 300
-
-; ---------------------------------------------------------------------------
-; SOA
-; ---------------------------------------------------------------------------
-@   IN  SOA  ns1.zerotrustradio.org. hostmaster.zerotrustradio.org. (
-                2024051001 ; serial  (YYYYMMDDNN)
-                3600       ; refresh
-                900        ; retry
-                604800     ; expire
-                300        ; minimum / negative TTL
-            )
-
-; ---------------------------------------------------------------------------
-; Nameservers — minimal set, DNS-protocol only (UDP/TCP 53)
-; No asset serving from these hosts.
-; ---------------------------------------------------------------------------
-@    IN  NS   ns1.zerotrustradio.org.
-@    IN  NS   ns2.zerotrustradio.org.
-
-; Glue records — replace placeholders with actual NS host IPs
-ns1  IN  A     <NS1_IPV4>
-ns1  IN  AAAA  <NS1_IPV6>
-ns2  IN  A     <NS2_IPV4>
-ns2  IN  AAAA  <NS2_IPV6>
-
-; ---------------------------------------------------------------------------
-; CNAME — all public RadioDNS assets served via DO Spaces CDN
-; DNS nodes never serve SPI XML, logos, EPG, VIS, or evidence directly.
-; ---------------------------------------------------------------------------
-spi      IN  CNAME  ztr-spi.nyc3.cdn.digitaloceanspaces.com.
-logos    IN  CNAME  ztr-logos.nyc3.cdn.digitaloceanspaces.com.
-epg      IN  CNAME  ztr-epg.nyc3.cdn.digitaloceanspaces.com.
-vis      IN  CNAME  ztr-vis.nyc3.cdn.digitaloceanspaces.com.
-evidence IN  CNAME  ztr-evidence.nyc3.cdn.digitaloceanspaces.com.
-
-; HTTP control plane on App Platform
-api      IN  CNAME  zerotrustradio.org.ondigitalocean.app.
-
-; ---------------------------------------------------------------------------
-; SRV — RadioDNS service discovery (DAB/FM/AM bearer lookup per RFC 5507)
-; Targets resolve to CDN or App Platform, never bare IP addresses.
-; ---------------------------------------------------------------------------
-_radiospi._tcp  IN  SRV  0 0 443  spi.zerotrustradio.org.
-_radioepg._tcp  IN  SRV  0 0 443  epg.zerotrustradio.org.
-_radiovis._tcp  IN  SRV  0 0 443  vis.zerotrustradio.org.
-_radiotag._tcp  IN  SRV  0 0 443  api.zerotrustradio.org.
-
-; ---------------------------------------------------------------------------
-; TXT — verification and sender policy
-; ---------------------------------------------------------------------------
-@        IN  TXT  "v=spf1 include:digitalocean.com ~all"
-_radiodns  IN  TXT  "v=RadioDNS1 auth=zerotrustradio"
-_dmarc   IN  TXT  "v=DMARC1; p=quarantine; rua=mailto:dmarc@zerotrustradio.org"
+# REMOVED — static zone files are not used with PowerDNS Authoritative.
+#
+# Zone data lives in the PostgreSQL database on the hidden master and is
+# provisioned via the PowerDNS HTTP API:
+#
+#   radiodns/dns/scripts/provision-zone.sh
+#
+# Secondaries (ns1-ns11) receive zone data via TSIG-authenticated AXFR/IXFR.

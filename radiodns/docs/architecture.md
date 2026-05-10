@@ -3,19 +3,23 @@
 ## Overview
 
 All public RadioDNS assets are served exclusively from DigitalOcean Spaces CDN.
-DNS nodes are minimal hosts that serve only the DNS protocol (UDP/TCP 53).
+DNS nodes run PowerDNS Authoritative in a hidden-master / secondary model.
 HTTP control-plane logic runs on DigitalOcean App Platform.
+No DNS node serves XML, logos, images, or any static files.
 
 ```
 Radio receiver / client
         │
-        ├─ DNS lookup ──────────────► CoreDNS node (UDP/TCP 53 only)
+        ├─ DNS lookup ──────────────► PowerDNS secondary (ns1-ns11)
+        │                              Receives zone via TSIG-auth AXFR/IXFR
+        │                              from hidden master.
         │                              SRV  _radiospi._tcp → spi.zerotrustradio.org
         │                              CNAME spi.zerotrustradio.org → CDN endpoint
-        │                              TXT, DNSSEC
-        │                              (no SPI XML, no logos served here)
+        │                              TXT, DNSSEC (ECDSA P-256)
+        │                              Exposes 53/udp + 53/tcp only.
+        │                              API disabled. No assets served.
         │
-        └─ HTTPS asset fetch ───────► DO Spaces CDN (global edge)
+        └─ HTTPS asset fetch ────────► DO Spaces CDN (global edge)
                                        spi.zerotrustradio.org      SPI XML / SI.xml
                                        logos.zerotrustradio.org    station logos
                                        epg.zerotrustradio.org      EPG XML
@@ -27,63 +31,106 @@ Broadcaster / operator
         └─ HTTPS API ───────────────► App Platform (api.zerotrustradio.org)
                                        radiodns-api     REST control plane
                                        radiodns-publisher  async Spaces writer
+
+Admin / operator
+        │
+        └─ PowerDNS API (private) ──► hidden-master.zerotrustradio.org:8081
+                                       Zone management, TSIG, DNSSEC
+                                       Private network + ufw only
 ```
+
+## DNS Layer: PowerDNS Hidden-Master + Secondary Model
+
+### Hidden Master
+
+- **Host**: `hidden-master.zerotrustradio.org` (private IP, not in NS records)
+- **Software**: PowerDNS Authoritative 4.9 + PostgreSQL 16 (gpgsql backend)
+- **Role**: `primary=yes`, `secondary=no`
+- **DNSSEC**: inline signing with ECDSA P-256 (KSK + ZSK)
+- **API**: enabled on port 8081, restricted to private network by ufw
+- **AXFR**: allowed from any IP; TSIG (hmac-sha256) required per zone
+- **Exposed ports**: 53/udp, 53/tcp (DNS), 8081/tcp (API, private only)
+
+### Public Secondaries (ns1–ns11)
+
+- **Software**: PowerDNS Authoritative 4.9 (lmdb backend)
+- **Role**: `secondary=yes`, `primary=no`
+- **Zone transfer**: TSIG-authenticated AXFR/IXFR from hidden master
+- **DNSSEC**: serves pre-signed records as received from master
+- **API**: disabled (`api=no`, `webserver=no`)
+- **Exposed ports**: 53/udp, 53/tcp only — ufw blocks 8081
+- **No static files, no HTTP, no XML, no logos served**
+
+### Zone Transfer Flow
+
+```
+hidden master (primary)
+  │  PostgreSQL stores zone + DNSSEC keys
+  │  Inline-signs all records
+  │  Notifies all ALSO-NOTIFY IPs on zone change
+  │
+  └─ AXFR/IXFR (TSIG hmac-sha256) ──► ns1  ─┐
+                                    ──► ns2  ─┤
+                                    ──► ...  ─┤  Serve queries
+                                    ──► ns11 ─┘  (pre-signed zone)
+```
+
+### TSIG Key Lifecycle
+
+1. `setup-tsig.sh` generates key on master, sets `TSIG-ALLOW-AXFR` + `AXFR-MASTER-TSIG`
+2. `add-secondary.sh` prints per-secondary `pdnsutil import-tsig-key` + `activate-tsig-key` commands
+3. Zone transfers are refused without a valid TSIG signature
+
+### DNSSEC
+
+- `enable-dnssec.sh` calls `pdnsutil secure-zone` → generates KSK + ZSK (ECDSA P-256)
+- NSEC3 opt-out narrow mode
+- DS records exported via `pdnsutil export-zone-ds` for registrar submission
+- Secondaries serve RRSIG, DNSKEY, NSEC3, DS as received from master AXFR
 
 ## CDN Hostnames
 
-| Hostname | Asset class | Spaces bucket |
-|---|---|---|
-| `spi.zerotrustradio.org` | SI.xml, SPI XML snapshots | `ztr-spi` |
-| `logos.zerotrustradio.org` | Station logos | `ztr-logos` |
-| `epg.zerotrustradio.org` | EPG XML documents | `ztr-epg` |
-| `vis.zerotrustradio.org` | RadioVIS slide images | `ztr-vis` |
-| `evidence.zerotrustradio.org` | Validation artifacts, metadata snapshots | `ztr-evidence` |
+| Hostname | Asset class | Spaces bucket | CDN TTL fallback |
+|---|---|---|---|
+| `spi.zerotrustradio.org` | SI.xml, SPI XML snapshots | `ztr-spi` | 600s |
+| `logos.zerotrustradio.org` | Station logos | `ztr-logos` | 604800s |
+| `epg.zerotrustradio.org` | EPG XML documents | `ztr-epg` | 3600s |
+| `vis.zerotrustradio.org` | RadioVIS slide images | `ztr-vis` | 3600s |
+| `evidence.zerotrustradio.org` | Validation artifacts | `ztr-evidence` | 86400s |
 
-All hostnames are CNAME records in the DO-managed DNS zone.
-CNAMEs resolve to the Spaces CDN endpoint, never to a DNS node IP.
+All are CNAME records in PowerDNS pointing to the Spaces CDN endpoint.
+DNS nodes never serve any of this content.
 
 ## Cache Strategy
 
 | Asset | Cache-Control | Notes |
 |---|---|---|
-| Canonical SI.xml (live) | `public, max-age=60, s-maxage=600` | Short client TTL, longer CDN TTL |
-| Versioned SPI snapshots | `public, max-age=3600` | Stable, moderate TTL |
-| Station logos | `public, max-age=604800, immutable` | Hash filename, cache forever |
+| Canonical SI.xml (live) | `public, max-age=60, s-maxage=600` | Short client TTL |
+| Versioned SPI snapshots | `public, max-age=3600` | |
+| Station logos | `public, max-age=604800, immutable` | SHA-256 hashed filename |
 | EPG documents | `public, max-age=3600` | |
-| RadioVIS slides | `public, max-age=3600` | Timestamp filename |
-| Evidence artifacts | `public, max-age=86400, immutable` | Hash filename, write-once |
-| App Platform frontend | CDN edge cache defaults | |
-
-Cache-Control headers are set per-object at upload time via the publish scripts
-or the publisher worker. The CDN endpoint TTL is a fallback only.
+| RadioVIS slides | `public, max-age=3600` | Unix timestamp filename |
+| Evidence artifacts | `public, max-age=86400, immutable` | SHA-256 hashed filename |
 
 ## Object Path Conventions
 
 ```
-# Cache-busting versioned SPI snapshot
-stations/{station_id}/spi/{version}/SI.xml
-
-# Canonical live SI.xml (short TTL, updated in-place)
-stations/{station_id}/spi/SI.xml
-
-# Immutable content-addressed logo
-stations/{station_id}/logos/{sha256}.png
-
-# Timestamp-keyed RadioVIS slide
-stations/{station_id}/vis/{unix_timestamp}.jpg
-
-# Immutable content-addressed evidence artifact
-evidence/{capture_id}/{sha256}.json
+stations/{station_id}/spi/SI.xml                    live (short TTL)
+stations/{station_id}/spi/{version}/SI.xml          versioned snapshot
+stations/{station_id}/logos/{sha256}.png            immutable
+stations/{station_id}/vis/{unix_timestamp}.jpg      timestamp-keyed
+evidence/{capture_id}/{sha256}.json                 immutable
 ```
 
-Logos and evidence artifacts use SHA-256 content hashes in the filename.
-A new upload of identical content produces the same key and hits the CDN
-cache immediately. A changed file produces a new key, bypassing the cache.
-
-## DNS Records (DNS nodes only serve these)
+## DNS Records (managed in PowerDNS via provision-zone.sh)
 
 ```
-; CNAME — CDN subdomains
+; NS — public secondaries only; hidden master not listed
+@  NS  ns1.zerotrustradio.org.
+@  NS  ns2.zerotrustradio.org.
+   ...  (ns3-ns11)
+
+; CNAME — CDN subdomains (never point to DNS node IPs)
 spi      CNAME  ztr-spi.nyc3.cdn.digitaloceanspaces.com.
 logos    CNAME  ztr-logos.nyc3.cdn.digitaloceanspaces.com.
 epg      CNAME  ztr-epg.nyc3.cdn.digitaloceanspaces.com.
@@ -98,62 +145,69 @@ _radiovis._tcp  SRV  0 0 443  vis.zerotrustradio.org.
 _radiotag._tcp  SRV  0 0 443  api.zerotrustradio.org.
 
 ; TXT
-@       TXT  "v=spf1 include:digitalocean.com ~all"
-_dmarc  TXT  "v=DMARC1; p=quarantine; ..."
+@        TXT  "v=spf1 include:digitalocean.com ~all"
+_radiodns  TXT  "v=RadioDNS1 auth=zerotrustradio"
+_dmarc   TXT  "v=DMARC1; p=quarantine; ..."
 ```
 
-## DNS Node Deployment
+## Deployment Playbook
 
-Deploy only where UDP/TCP port 53 is required (authoritative NS hosts).
-All other infrastructure uses App Platform or CDN.
-
-```bash
-# On each NS host
-cd radiodns/dns
-# Generate DNSSEC key pair
-dnssec-keygen -a ED25519 -n ZONE zerotrustradio.org
-mv Kzerotrustradio.org.* keys/
-# Start CoreDNS
-docker compose up -d
-```
-
-## Terraform Workflow
+### 1. Provision infrastructure with Terraform
 
 ```bash
 cd radiodns/infra/terraform
-
-# First run — create the state bucket manually in DO console, then:
-terraform init \
-  -backend-config="access_key=$SPACES_ACCESS_KEY" \
-  -backend-config="secret_key=$SPACES_SECRET_KEY"
-
-terraform plan -var="do_token=$DO_TOKEN" \
-               -var="spaces_access_id=$SPACES_ACCESS_KEY" \
-               -var="spaces_secret_key=$SPACES_SECRET_KEY"
-
-terraform apply  # creates all buckets, CDN endpoints, DNS records, App Platform app
+terraform apply \
+  -var="do_token=$DO_TOKEN" \
+  -var="pdns_db_password=$PDNS_DB_PASSWORD" \
+  -var="pdns_api_key=$PDNS_API_KEY" \
+  -var='ns_ips=["1.2.3.4","5.6.7.8",...]'   # 11 IPs
 ```
 
-## Publishing Assets
+### 2. Start hidden master
 
 ```bash
-export AWS_ACCESS_KEY_ID=$SPACES_ACCESS_KEY
-export AWS_SECRET_ACCESS_KEY=$SPACES_SECRET_KEY
-export SPACES_REGION=nyc3
+cd radiodns/dns/master
+PDNS_DB_PASSWORD=... PDNS_API_KEY=... docker compose up -d
+```
 
-# Publish live SI.xml (short TTL)
-./radiodns/scripts/publish-spi.sh bbc_radio4 live SI.xml
+### 3. Provision zone records
 
-# Publish versioned SPI snapshot
-./radiodns/scripts/publish-spi.sh bbc_radio4 v20240510 SI.xml
+```bash
+export PDNS_API_URL=http://hidden-master:8081
+export PDNS_API_KEY=...
+export NS_IPS="1.2.3.4 5.6.7.8 ..."    # 11 IPs
+radiodns/dns/scripts/provision-zone.sh
+```
 
-# Publish logo (immutable, hash filename)
-./radiodns/scripts/publish-logos.sh bbc_radio4 logo.png
+### 4. Configure TSIG
 
-# Publish evidence artifact (immutable, hash filename)
-./radiodns/scripts/publish-evidence.sh cap-20240510-001 capture.json
+```bash
+radiodns/dns/scripts/setup-tsig.sh
+# → outputs TSIG_SECRET; export it
+export TSIG_SECRET=...
+```
 
-# Invalidate CDN cache (for live SI.xml after update)
-export DO_TOKEN=...
-./radiodns/scripts/invalidate-cdn.sh <spi-cdn-uuid> stations/bbc_radio4/spi/SI.xml
+### 5. Enable DNSSEC
+
+```bash
+# On the hidden master:
+docker exec pdns-master radiodns/dns/scripts/enable-dnssec.sh
+# Submit DS records to registrar
+```
+
+### 6. Bring up each secondary
+
+```bash
+export HIDDEN_MASTER_IP=10.0.0.1
+for ip in ${NS_IPS}; do
+  ssh root@${ip} 'cd /opt/radiodns/secondary && docker compose up -d'
+  radiodns/dns/scripts/add-secondary.sh ${ip} ns${n}.zerotrustradio.org
+done
+```
+
+### 7. Verify
+
+```bash
+radiodns/dns/scripts/verify-zone.sh
+NS_HOST=ns1.zerotrustradio.org radiodns/dns/scripts/verify-zone.sh
 ```
