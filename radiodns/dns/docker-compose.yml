@@ -1,0 +1,38 @@
+# Minimal DNS node deployment
+# Serves UDP/TCP 53 only — no HTTP asset serving.
+# Deploy one instance per region where authoritative DNS is required.
+
+services:
+  coredns:
+    image: coredns/coredns:1.11.3
+    restart: unless-stopped
+    command: -conf /etc/coredns/Corefile
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    volumes:
+      - ./Corefile:/etc/coredns/Corefile:ro
+      - ./zones:/etc/coredns/zones:ro
+      - ./keys:/etc/coredns/keys:ro
+    healthcheck:
+      test: ["CMD", "dig", "@127.0.0.1", "zerotrustradio.org", "SOA"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.listen-address=0.0.0.0:9090"
+
+volumes:
+  prometheus_data:

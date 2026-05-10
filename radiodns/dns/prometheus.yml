@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: coredns
+    static_configs:
+      - targets: ["coredns:9153"]

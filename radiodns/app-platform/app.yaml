@@ -1,0 +1,84 @@
+# DigitalOcean App Platform spec — RadioDNS HTTP control plane
+# Apply with: doctl apps create --spec radiodns/app-platform/app.yaml
+# or via Terraform (radiodns/infra/terraform/app-platform.tf)
+
+name: radiodns-control-plane
+region: nyc
+
+domains:
+  - domain: api.zerotrustradio.org
+    type: PRIMARY
+    zone: zerotrustradio.org
+    minimum_tls_version: "1.2"
+
+envs:
+  - key: SPACES_REGION
+    value: nyc3
+    scope: RUN_TIME
+  - key: SPI_BUCKET
+    value: ztr-spi
+    scope: RUN_TIME
+  - key: LOGOS_BUCKET
+    value: ztr-logos
+    scope: RUN_TIME
+  - key: EPG_BUCKET
+    value: ztr-epg
+    scope: RUN_TIME
+  - key: VIS_BUCKET
+    value: ztr-vis
+    scope: RUN_TIME
+  - key: EVIDENCE_BUCKET
+    value: ztr-evidence
+    scope: RUN_TIME
+  - key: SPI_CDN_HOST
+    value: spi.zerotrustradio.org
+    scope: RUN_TIME
+  - key: LOGOS_CDN_HOST
+    value: logos.zerotrustradio.org
+    scope: RUN_TIME
+  - key: EPG_CDN_HOST
+    value: epg.zerotrustradio.org
+    scope: RUN_TIME
+  - key: VIS_CDN_HOST
+    value: vis.zerotrustradio.org
+    scope: RUN_TIME
+  - key: EVIDENCE_CDN_HOST
+    value: evidence.zerotrustradio.org
+    scope: RUN_TIME
+  # Inject secrets via `doctl apps update` or the DO console — never commit values
+  - key: DO_SPACES_ACCESS_KEY
+    scope: RUN_TIME
+    type: SECRET
+  - key: DO_SPACES_SECRET_KEY
+    scope: RUN_TIME
+    type: SECRET
+
+services:
+  - name: radiodns-api
+    github:
+      repo: chelstein/splat
+      branch: main
+      deploy_on_push: true
+    source_dir: radiodns/services/api
+    dockerfile_path: radiodns/services/api/Dockerfile
+    instance_count: 1
+    instance_size_slug: apps-s-1vcpu-0.5gb
+    http_port: 8080
+    health_check:
+      http_path: /health
+      initial_delay_seconds: 10
+      period_seconds: 30
+      timeout_seconds: 5
+      failure_threshold: 3
+      success_threshold: 1
+
+workers:
+  - name: radiodns-publisher
+    github:
+      repo: chelstein/splat
+      branch: main
+      deploy_on_push: true
+    source_dir: radiodns/services/publisher
+    dockerfile_path: radiodns/services/publisher/Dockerfile
+    instance_count: 1
+    instance_size_slug: apps-s-1vcpu-0.5gb

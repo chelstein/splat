@@ -1,0 +1,39 @@
+# CoreDNS — authoritative DNS for zerotrustradio.org
+#
+# This node serves CNAME, SRV, TXT, and DNSSEC records only.
+# It does NOT serve SPI XML, logos, EPG, VIS, or any other RadioDNS assets.
+# All public assets are served via DigitalOcean Spaces CDN.
+
+zerotrustradio.org:53 {
+    file /etc/coredns/zones/zerotrustradio.org.zone {
+        reload 30s
+    }
+
+    dnssec {
+        key file /etc/coredns/keys/Kzerotrustradio.org
+    }
+
+    log . "{remote} {type} {name} {class} {rcode} {size} {duration}"
+
+    errors
+
+    health :8080
+
+    prometheus :9153
+
+    # Cache only short-lived records; CDN subdomains have TTL=300
+    cache 30
+}
+
+# Refuse all queries for zones we do not own
+.:53 {
+    errors
+    log . {
+        class denial error
+    }
+    acl {
+        block type ANY
+        block type AXFR
+        block type IXFR
+    }
+}
