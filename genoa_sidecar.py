@@ -8,6 +8,7 @@ Flask + gunicorn version (so the DigitalOcean App Platform CMD
   GET    /version                       -> sidecar metadata + git SHA + SPLAT version  (always open)
   GET    /api/v1/stats                  -> per-worker run counters           (always open)
   POST   /api/v1/splat/run              -> runs ./splat with the given args  (auth-gated when GENOA_API_TOKEN is set)
+  POST   /api/v1/splat/run-inline       -> JSON-in coverage sweep (no on-disk QTH) (auth-gated)
   GET    /api/v1/artifacts              -> list files in WORKDIR              (auth-gated)
   GET    /api/v1/artifacts/<path>       -> fetch a file from WORKDIR         (auth-gated)
   GET    /api/v1/sdf                    -> list SPLAT terrain (.sdf/.sdz) tiles  (auth-gated)
@@ -534,6 +535,21 @@ def _build_command(payload: dict) -> Union[list, str]:
         command.append(str(flag))
 
     return command
+
+
+# Register the JSON-in inline coverage sweep endpoint.  Kept in a
+# separate module so the host file stays focused on lifecycle + path
+# confinement; the blueprint reuses _is_authorized so auth behaves
+# identically to the rest of /api/v1/*.
+import inline_runner  # noqa: E402
+
+inline_runner.attach(
+    workdir=WORKDIR,
+    sdf_dir_name=SDF_DIR_NAME,
+    splat_bin=SPLAT_BIN,
+    is_authorized=_is_authorized,
+)
+app.register_blueprint(inline_runner.bp)
 
 
 _start_sweeper()
