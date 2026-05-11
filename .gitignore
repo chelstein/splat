@@ -10,6 +10,7 @@ __pycache__/
 # Local dev
 .env
 .env.local
+.claude/settings.local.json
 .venv/
 venv/
 
