@@ -78,4 +78,16 @@ ENV GENOA_HOST=0.0.0.0 \
 EXPOSE 8080
 
 # DigitalOcean App Platform sets $PORT; default to 8080 locally.
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --timeout 180 genoa_sidecar:app"]
+#
+# Worker / timeout sizing notes:
+#   --worker-class gthread + --threads 4   so a long-running inline
+#       coverage sweep on one thread doesn't block /healthz, /version,
+#       or other p2p calls landing on the same gunicorn worker.  With
+#       only --workers 2, two concurrent sync requests would starve the
+#       health check and risk an auto-restart mid-compute.
+#   --timeout 600                          per-radial sweep with 36
+#       radials × 15 s floor = up to 540 s worst case.  Old 180 s
+#       timeout would kill long sweeps and surface as 502 to genoa.
+#       inline_runner clamps client timeout_seconds to ≤ 540 so it
+#       always stays under this gunicorn ceiling.
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8080} --workers 2 --worker-class gthread --threads 4 --timeout 600 genoa_sidecar:app"]

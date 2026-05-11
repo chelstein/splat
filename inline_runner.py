@@ -23,6 +23,14 @@ DEM tiles must be provisioned at WORKDIR/sdf/ ahead of time via the
 existing /api/v1/sdf upload routes.  Without tiles, SPLAT falls back
 to flat-Earth and the response carries terrain_used=false so the
 caller knows the run is non-terrain-aware.
+
+Timeout envelope:
+  The outer gunicorn worker timeout is 600 s (Dockerfile CMD).  This
+  module clamps the client-supplied `timeout_seconds` to MAX_TIMEOUT_S
+  (540 s) so the inline sweep always finishes under the gunicorn
+  ceiling — preventing the worker-kill-mid-sweep failure mode where
+  the caller sees an HTTP 502 and a half-populated run dir is left on
+  disk.  Per-radial timeout is derived as max(15, total/n_radials).
 """
 
 from __future__ import annotations
@@ -46,6 +54,14 @@ log = logging.getLogger("genoa-sidecar.inline-runner")
 # auth + WORKDIR + SPLAT_BIN with the host module without a circular
 # import.
 _CFG: Dict[str, Any] = {}
+
+# Hard upper bound on the client-supplied timeout.  Must stay strictly
+# under the gunicorn worker --timeout (600 s in Dockerfile CMD) so the
+# inline route always returns before the worker is killed.  60 s of
+# headroom covers loss-table parsing, JSON serialisation, and the
+# per-radial cleanup loop.
+MAX_TIMEOUT_S = 540
+DEFAULT_TIMEOUT_S = 180
 
 
 def attach(*, workdir: Path, sdf_dir_name: str, splat_bin: str,
@@ -242,6 +258,11 @@ def _validate_payload(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[
     if erp <= 0 or erp > 5000:
         return "erp_kw out of range (0..5000)", None
 
+    # Clamp client-supplied timeout to MAX_TIMEOUT_S so the route
+    # always returns before the gunicorn worker --timeout fires.
+    raw_timeout = int(payload.get("timeout_seconds") or DEFAULT_TIMEOUT_S)
+    timeout_s = max(15, min(raw_timeout, MAX_TIMEOUT_S))
+
     return None, {
         "tx_qth_content":   str(payload["tx_qth_content"]),
         "tx_call":          str(payload.get("tx_call") or "TX"),
@@ -253,7 +274,9 @@ def _validate_payload(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[
         "radial_step_deg":  float(payload.get("radial_step_deg") or 10),
         "target_field_dbu": float(payload.get("target_field_dbu") or 60),
         "rx_height_m":      float(payload.get("rx_height_m") or 10),
-        "timeout_seconds":  int(payload.get("timeout_seconds") or 180),
+        "timeout_seconds":  timeout_s,
+        "timeout_clamped":  timeout_s != raw_timeout,
+        "timeout_requested": raw_timeout,
     }
 
 
@@ -412,6 +435,9 @@ def run_inline():
             "radial_count":     len(radials_out),
             "target_field_dbu": target,
             "max_distance_km":  max_km,
+            "timeout_seconds":  params["timeout_seconds"],
+            "timeout_clamped":  params["timeout_clamped"],
+            "timeout_requested": params["timeout_requested"],
             "radials":          radials_out,
             "stdout":           "".join(stdout_chunks)[:8000],
         })
