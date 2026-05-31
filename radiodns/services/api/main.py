@@ -1,10 +1,14 @@
 """RadioDNS control plane API."""
 
+import base64
 import hashlib
 import os
 from datetime import datetime, timezone
+from typing import Optional
 
 import boto3
+import psycopg2
+import psycopg2.extras
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -143,3 +147,85 @@ async def publish_vis(station_id: str, file: UploadFile):
         ACL="public-read",
     )
     return {"url": f"https://{CDN_HOSTS['vis']}/{key}"}
+
+
+# ---------------------------------------------------------------------------
+# Async publish job queue
+#
+# POST /internal/jobs  — enqueue a publish job for the worker to process.
+#
+# The worker (radiodns/services/publisher/worker.py) polls
+# radiodns_publish_jobs and executes each job by writing to Spaces.
+# This endpoint is internal — callers must be on the App Platform
+# private network (not exposed via public CDN/DNS).
+#
+# Request body:
+#   { asset_type, bucket, key, content_type, body_b64 }
+#   body_b64: base64-encoded asset bytes
+# Response: { job_id }
+# ---------------------------------------------------------------------------
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+ENQUEUE_SQL = """
+INSERT INTO radiodns_publish_jobs
+    (asset_type, bucket, key, content_type, body_b64)
+VALUES (%s, %s, %s, %s, %s)
+RETURNING id;
+"""
+
+VALID_ASSET_TYPES = {"logo", "spi_live", "spi_snapshot", "epg", "vis", "evidence"}
+
+
+class PublishJobRequest(BaseModel):
+    asset_type:   str
+    bucket:       str
+    key:          str
+    content_type: str
+    body_b64:     str   # base64-encoded bytes
+
+
+@app.post("/internal/jobs")
+def enqueue_job(req: PublishJobRequest):
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL not configured — job queue unavailable")
+    if req.asset_type not in VALID_ASSET_TYPES:
+        raise HTTPException(status_code=400, detail=f"unknown asset_type: {req.asset_type}. Valid: {sorted(VALID_ASSET_TYPES)}")
+    try:
+        base64.b64decode(req.body_b64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="body_b64 is not valid base64")
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(ENQUEUE_SQL, (req.asset_type, req.bucket, req.key, req.content_type, req.body_b64))
+                row = cur.fetchone()
+        conn.close()
+    except psycopg2.Error as exc:
+        raise HTTPException(status_code=503, detail=f"database error: {exc}")
+
+    return {"job_id": str(row["id"])}
+
+
+@app.get("/internal/jobs/{job_id}")
+def get_job(job_id: str):
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="DATABASE_URL not configured")
+    try:
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, asset_type, bucket, key, status, error, created_at, updated_at FROM radiodns_publish_jobs WHERE id=%s",
+                    (job_id,),
+                )
+                row = cur.fetchone()
+        conn.close()
+    except psycopg2.Error as exc:
+        raise HTTPException(status_code=503, detail=f"database error: {exc}")
+
+    if not row:
+        raise HTTPException(status_code=404, detail="job not found")
+    return dict(row)
