@@ -52,6 +52,9 @@ envs:
   - key: DO_SPACES_SECRET_KEY
     scope: RUN_TIME
     type: SECRET
+  - key: DATABASE_URL
+    scope: RUN_TIME
+    type: SECRET
 
 services:
   - name: radiodns-api
